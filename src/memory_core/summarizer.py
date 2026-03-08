@@ -2,34 +2,40 @@ from loguru import logger
 from .models import Message
 from .llm_client import LLMClient
 
-SUMMARY_PROMPT_WITH_CONTEXT = """你是一个对话总结助手。请基于历史上下文，总结最新对话的关键信息。
+SUMMARY_PROMPT_WITH_CONTEXT = """# 任务：总结对话
 
-## 历史上下文（之前的总结）：
+你是一个总结助手，不是对话参与者。不要继续对话，只需要输出总结。
+
+## 历史背景
 {previous_context}
 
-## 最新对话内容：
+## 需要总结的对话
 {conversation}
 
-## 请总结最新对话的关键信息，包括：
-1. 讨论的主要话题
-2. 做出的重要决定
-3. 待办事项或后续行动
-4. 任何需要记住的关键上下文
-5. 用户的特殊提醒跟习惯
+## 输出要求
+直接输出总结文本（不要输出"助手:"或任何角色标签），包括：
+1. 主要话题
+2. 重要决定
+3. 待办事项
+4. 关键上下文
 
-注意：结合历史上下文，但只总结最新对话的内容。请用简洁的中文总结（不超过500字）："""
+用简洁中文，不超过500字。"""
 
-SUMMARY_PROMPT = """请总结以下对话的关键信息，包括：
-1. 讨论的主要话题
-2. 做出的重要决定
-3. 待办事项或后续行动
-4. 任何需要记住的关键上下文
-5. 用户的特殊提醒跟习惯
+SUMMARY_PROMPT = """# 任务：总结对话
 
-对话内容：
+你是一个总结助手，不是对话参与者。不要继续对话，只需要输出总结。
+
+## 需要总结的对话
 {conversation}
 
-请用简洁的中文总结（不超过500字）："""
+## 输出要求
+直接输出总结文本（不要输出"助手:"或任何角色标签），包括：
+1. 主要话题
+2. 重要决定
+3. 待办事项
+4. 关键上下文
+
+用简洁中文，不超过500字。"""
 
 
 class SummaryGenerator:
@@ -62,12 +68,22 @@ class SummaryGenerator:
         logger.debug(f"Summary preview: {result[:200]}...")
         return result
 
-    def _format_conversation(self, messages: list[Message]) -> str:
-        logger.debug(f"Formatting {len(messages)} messages for summary")
+    def _format_conversation(self, messages: list[Message], max_chars: int = 8000) -> str:
+        """格式化对话内容，限制总长度避免 prompt 过长"""
+        logger.debug(f"Formatting {len(messages)} messages for summary (max_chars={max_chars})")
         lines = []
-        for msg in messages:
+        total_chars = 0
+        # 优先保留最近的消息
+        for msg in reversed(messages):
             role_label = {"user": "用户", "assistant": "助手", "system": "系统"}.get(
                 msg.role, msg.role
             )
-            lines.append(f"{role_label}: {msg.content}")
+            # 每条消息最多500字符
+            content = msg.content[:500] if len(msg.content) > 500 else msg.content
+            line = f"{role_label}: {content}"
+            if total_chars + len(line) > max_chars:
+                break
+            lines.insert(0, line)
+            total_chars += len(line)
+        logger.debug(f"Formatted {len(lines)} messages, total {total_chars} chars")
         return "\n".join(lines)

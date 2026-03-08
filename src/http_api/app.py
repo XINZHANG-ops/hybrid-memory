@@ -253,6 +253,50 @@ def get_logs(lines: int = 100):
     return {"logs": all_lines[-lines:]}
 
 
+@app.get("/api/token-usage")
+def get_token_usage(project_name: str | None = None):
+    if project_name:
+        db_path = PROJECTS_DIR / f"{project_name}.db"
+        if not db_path.exists():
+            raise HTTPException(404, "Project not found")
+    else:
+        db_path = GLOBAL_DB
+        if not db_path.exists():
+            return {"stats": {"total_input_tokens": 0, "total_output_tokens": 0, "request_count": 0}, "history": [], "cost": {"input_cost": 0, "output_cost": 0, "total_cost": 0}}
+
+    db = Database(db_path)
+    stats = db.get_token_usage_stats()
+    history = db.get_token_usage_history(limit=50)
+
+    input_price = float(db.get_config("input_token_price", "0.003"))
+    output_price = float(db.get_config("output_token_price", "0.015"))
+
+    input_cost = (stats["total_input_tokens"] / 1000) * input_price
+    output_cost = (stats["total_output_tokens"] / 1000) * output_price
+
+    return {
+        "stats": stats,
+        "history": [
+            {
+                "id": u.id,
+                "session_id": u.session_id,
+                "input_tokens": u.input_tokens,
+                "output_tokens": u.output_tokens,
+                "model": u.model,
+                "timestamp": u.timestamp.isoformat() if u.timestamp else None,
+            }
+            for u in history
+        ],
+        "cost": {
+            "input_cost": round(input_cost, 4),
+            "output_cost": round(output_cost, 4),
+            "total_cost": round(input_cost + output_cost, 4),
+            "input_price_per_1k": input_price,
+            "output_price_per_1k": output_price,
+        }
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -322,6 +366,7 @@ def web_ui():
             <button class="tab" onclick="showPanel('summaries')">Summaries</button>
             <button class="tab" onclick="showPanel('context')">Injected Context</button>
             <button class="tab" onclick="showPanel('search')">Search</button>
+            <button class="tab" onclick="showPanel('token-usage')">Token Usage</button>
             <button class="tab" onclick="showPanel('logs')">Logs</button>
             <button class="tab" onclick="showPanel('config')">Config</button>
         </div>
@@ -341,13 +386,14 @@ def web_ui():
         <!-- Messages Panel -->
         <div id="messages" class="panel">
             <h2>Recent Messages</h2>
-            <div style="margin-bottom: 15px;">
+            <div style="margin-bottom: 15px; display: flex; gap: 10px; align-items: center;">
                 <select id="msg-project" onchange="loadMessages()">
                     <option value="">-- Select Project --</option>
                 </select>
                 <select id="msg-session" onchange="loadMessages()">
                     <option value="">All Sessions</option>
                 </select>
+                <button onclick="loadMessages()">Refresh</button>
             </div>
             <div id="message-list"></div>
         </div>
@@ -381,6 +427,14 @@ def web_ui():
             <div id="search-results"></div>
         </div>
 
+        <!-- Token Usage Panel -->
+        <div id="token-usage" class="panel">
+            <h2>Token Usage & Cost</h2>
+            <div class="grid" id="token-stats"></div>
+            <h3 style="margin: 20px 0 10px; color: #00d9ff;">Recent Usage History</h3>
+            <div id="token-history"></div>
+        </div>
+
         <!-- Logs Panel -->
         <div id="logs" class="panel">
             <h2>Hook Logs</h2>
@@ -406,12 +460,15 @@ def web_ui():
 
     <script>
         let projects = [];
+        let currentPanel = 'overview';
+        let autoRefreshEnabled = true;
 
         function showPanel(id) {
             document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.getElementById(id).classList.add('active');
             event.target.classList.add('active');
+            currentPanel = id;
         }
 
         async function loadProjects() {
@@ -419,13 +476,21 @@ def web_ui():
             const data = await res.json();
             projects = data.projects;
 
-            // Update stats
+            // Update stats with token usage
             let totalMsgs = 0, totalSums = 0;
             projects.forEach(p => { totalMsgs += p.messages || 0; totalSums += p.summaries || 0; });
+
+            const tokenRes = await fetch('/api/token-usage');
+            const tokenData = await tokenRes.json();
+            const cost = tokenData.cost;
+
             document.getElementById('stats').innerHTML = `
                 <div class="card stat"><div class="stat-value">${projects.length}</div><div class="stat-label">Projects</div></div>
                 <div class="card stat"><div class="stat-value">${totalMsgs}</div><div class="stat-label">Total Messages</div></div>
                 <div class="card stat"><div class="stat-value">${totalSums}</div><div class="stat-label">Summaries</div></div>
+                <div class="card stat"><div class="stat-value">${formatNumber(tokenData.stats.total_input_tokens)}</div><div class="stat-label">Input Tokens</div></div>
+                <div class="card stat"><div class="stat-value">${formatNumber(tokenData.stats.total_output_tokens)}</div><div class="stat-label">Output Tokens</div></div>
+                <div class="card stat" style="background: #1f4068;"><div class="stat-value" style="color: #e94560;">$${cost.total_cost.toFixed(4)}</div><div class="stat-label">Total Cost</div></div>
             `;
 
             // Update project list
@@ -541,6 +606,47 @@ def web_ui():
                 : '<p style="color: #888;">No configuration set</p>';
         }
 
+        async function loadTokenUsage() {
+            const res = await fetch('/api/token-usage');
+            const data = await res.json();
+            const stats = data.stats;
+            const cost = data.cost;
+
+            document.getElementById('token-stats').innerHTML = `
+                <div class="card stat"><div class="stat-value">${formatNumber(stats.total_input_tokens)}</div><div class="stat-label">Input Tokens</div></div>
+                <div class="card stat"><div class="stat-value">${formatNumber(stats.total_output_tokens)}</div><div class="stat-label">Output Tokens</div></div>
+                <div class="card stat"><div class="stat-value">${stats.request_count}</div><div class="stat-label">Requests</div></div>
+                <div class="card stat"><div class="stat-value">$${cost.input_cost.toFixed(4)}</div><div class="stat-label">Input Cost</div></div>
+                <div class="card stat"><div class="stat-value">$${cost.output_cost.toFixed(4)}</div><div class="stat-label">Output Cost</div></div>
+                <div class="card stat" style="background: #1f4068;"><div class="stat-value" style="color: #e94560;">$${cost.total_cost.toFixed(4)}</div><div class="stat-label">Total Cost</div></div>
+            `;
+
+            document.getElementById('token-history').innerHTML = data.history.length > 0
+                ? `<table style="width: 100%; border-collapse: collapse;">
+                    <tr style="border-bottom: 1px solid #333;">
+                        <th style="text-align: left; padding: 8px;">Time</th>
+                        <th style="text-align: right; padding: 8px;">Input</th>
+                        <th style="text-align: right; padding: 8px;">Output</th>
+                        <th style="text-align: left; padding: 8px;">Model</th>
+                    </tr>
+                    ${data.history.map(u => `
+                        <tr style="border-bottom: 1px solid #222;">
+                            <td style="padding: 8px;">${new Date(u.timestamp).toLocaleString()}</td>
+                            <td style="text-align: right; padding: 8px;">${formatNumber(u.input_tokens)}</td>
+                            <td style="text-align: right; padding: 8px;">${formatNumber(u.output_tokens)}</td>
+                            <td style="padding: 8px; color: #888;">${u.model || '-'}</td>
+                        </tr>
+                    `).join('')}
+                </table>`
+                : '<p style="color: #888;">No usage data yet</p>';
+        }
+
+        function formatNumber(num) {
+            if (num >= 1000000) return (num / 1000000).toFixed(2) + 'M';
+            if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
+            return num.toString();
+        }
+
         async function saveConfig() {
             const key = document.getElementById('config-key').value;
             const value = document.getElementById('config-value').value;
@@ -563,10 +669,23 @@ def web_ui():
         async function refreshAll() {
             await loadProjects();
             loadConfig();
+            loadTokenUsage();
         }
 
-        // Auto-refresh every 5 seconds
-        setInterval(refreshAll, 5000);
+        async function autoRefresh() {
+            // Save scroll position before refresh
+            const scrollTop = window.scrollY;
+
+            await loadProjects();
+            loadConfig();
+            loadTokenUsage();
+
+            // Restore scroll position after refresh
+            window.scrollTo(0, scrollTop);
+        }
+
+        // Auto-refresh every 5 seconds with scroll position preservation
+        setInterval(autoRefresh, 5000);
 
         // Initial load
         refreshAll();

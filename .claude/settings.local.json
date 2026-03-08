@@ -34,7 +34,14 @@
       "Bash(powershell -NoProfile -Command:*)",
       "Bash(dir:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(git remote add:*)",
+      "Bash(git branch:*)",
+      "Bash(git push:*)",
+      "Bash(sqlite3:*)",
+      "Bash(chcp:*)",
+      "Bash(ollama list:*)",
+      "Bash(del:*)"
     ]
   }
 }

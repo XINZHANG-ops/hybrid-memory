@@ -11,7 +11,7 @@ DEFAULT_CONFIG = {
     "max_context_tokens": "8000",
     "summary_trigger_threshold": "50",
     "llm_provider": "ollama",
-    "ollama_model": "qwen2.5:7b",
+    "ollama_model": "qwen3:8b",
     "ollama_base_url": "http://localhost:11434",
     "ollama_timeout": "300",
     "ollama_keep_alive": "10m",
@@ -19,6 +19,14 @@ DEFAULT_CONFIG = {
     "embedding_model": "embeddinggemma:300m",
     "enable_vector_search": "true",
     "enable_knowledge_extraction": "true",
+    "input_token_price": "0.003",
+    "output_token_price": "0.015",
+    # 注入相关配置
+    "inject_summary_count": "5",
+    "inject_recent_count": "5",
+    "inject_preview_length": "200",
+    "inject_knowledge_count": "5",
+    "inject_task_count": "3",
 }
 
 # 配置元数据（用于 UI 展示）
@@ -93,6 +101,56 @@ CONFIG_META = {
         "description": "自动从对话中提取结构化知识",
         "type": "select",
         "options": ["true", "false"],
+    },
+    "input_token_price": {
+        "label": "Input Token 单价",
+        "description": "每 1K input tokens 的价格（美元）",
+        "type": "number",
+        "min": 0,
+        "max": 1,
+    },
+    "output_token_price": {
+        "label": "Output Token 单价",
+        "description": "每 1K output tokens 的价格（美元）",
+        "type": "number",
+        "min": 0,
+        "max": 1,
+    },
+    # 注入相关配置
+    "inject_summary_count": {
+        "label": "注入摘要数量",
+        "description": "启动时注入多少条历史摘要",
+        "type": "number",
+        "min": 1,
+        "max": 20,
+    },
+    "inject_recent_count": {
+        "label": "注入近期对话数",
+        "description": "启动时注入多少条近期对话",
+        "type": "number",
+        "min": 3,
+        "max": 20,
+    },
+    "inject_preview_length": {
+        "label": "消息截取长度",
+        "description": "每条消息截取的字符数（0=不截取）",
+        "type": "number",
+        "min": 0,
+        "max": 2000,
+    },
+    "inject_knowledge_count": {
+        "label": "知识项数量",
+        "description": "每类知识显示多少条",
+        "type": "number",
+        "min": 1,
+        "max": 20,
+    },
+    "inject_task_count": {
+        "label": "待办项数量",
+        "description": "显示多少条待办事项",
+        "type": "number",
+        "min": 1,
+        "max": 10,
     },
 }
 

@@ -34,3 +34,13 @@ class Session:
     started_at: datetime = field(default_factory=datetime.now)
     last_active_at: datetime = field(default_factory=datetime.now)
     is_active: bool = True
+
+
+@dataclass
+class TokenUsage:
+    id: int | None
+    session_id: str
+    input_tokens: int
+    output_tokens: int
+    model: str = ""
+    timestamp: datetime = field(default_factory=datetime.now)

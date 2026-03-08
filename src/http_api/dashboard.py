@@ -121,13 +121,26 @@ def get_context(project_name):
         return json_response({"error": "Project not found"}), 404
     db = Database(db_path)
 
-    # 获取所有会话的摘要和最近消息（跨会话）
-    all_summaries = db.get_all_summaries(limit=5)
-    recent_messages = db.get_recent_messages_all_sessions(limit=10)
+    # 从配置读取注入参数（与 sessionStart.py 一致）
+    from src.memory_core.config import load_config
+    config_mgr = load_config(GLOBAL_DB)
+    inject_summary_count = config_mgr.get_int("inject_summary_count")
+    inject_recent_count = config_mgr.get_int("inject_recent_count")
+    inject_preview_length = config_mgr.get_int("inject_preview_length")
+
+    # 获取摘要和消息（使用配置的数量）
+    all_summaries = db.get_all_summaries(limit=inject_summary_count)
+    recent_messages = db.get_recent_messages_all_sessions(limit=inject_recent_count)
+
+    # 截取消息内容（与注入时一致）
+    def truncate(text, max_len):
+        if max_len <= 0 or len(text) <= max_len:
+            return text
+        return text[:max_len] + "..."
 
     context = {
         "summaries": "\n\n---\n\n".join(s.summary_text for s in all_summaries) if all_summaries else "",
-        "messages": [{"role": m.role, "content": m.content} for m in reversed(recent_messages)] if recent_messages else []
+        "messages": [{"role": m.role, "content": truncate(m.content, inject_preview_length)} for m in reversed(recent_messages)] if recent_messages else []
     }
     return json_response(context)
 
@@ -263,6 +276,9 @@ def index():
     <title>Hybrid Memory Dashboard</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
+        /* Hide scrollbar but keep scroll functionality */
+        *::-webkit-scrollbar { display: none; }
+        * { -ms-overflow-style: none; scrollbar-width: none; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; }
         .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 10px; }
@@ -284,7 +300,7 @@ def index():
         .message.user { background: #1f4068; border-left: 3px solid #00d9ff; }
         .message.assistant { background: #0f3460; border-left: 3px solid #e94560; }
         .message-role { font-weight: bold; color: #00d9ff; margin-bottom: 5px; }
-        .message-content { white-space: pre-wrap; word-break: break-word; font-size: 0.9em; line-height: 1.5; max-height: 300px; overflow-y: auto; }
+        .message-content { white-space: pre-wrap; word-break: break-word; font-size: 0.9em; line-height: 1.5; }
         .message-meta { font-size: 0.75em; color: #888; margin-top: 5px; }
         .summary { background: #1f4068; padding: 15px; border-radius: 5px; margin: 10px 0; border-left: 3px solid #e94560; }
         .summary-text { white-space: pre-wrap; line-height: 1.6; }
@@ -307,17 +323,27 @@ def index():
         .context-label { color: #00d9ff; font-weight: bold; margin-bottom: 5px; }
         .session-select { margin-bottom: 15px; }
         .no-project { color: #888; padding: 20px; text-align: center; }
+        /* Modal styles */
+        .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 1000; }
+        .modal-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); }
+        .modal-content { position: relative; max-width: 700px; max-height: 85vh; margin: 50px auto; background: #16213e; border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; padding: 15px 20px; border-bottom: 1px solid #333; }
+        .modal-body { padding: 20px; overflow-y: auto; flex: 1; }
+        .modal-footer { padding: 15px 20px; border-top: 1px solid #333; display: flex; justify-content: flex-end; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>Hybrid Memory Dashboard</h1>
-            <div class="global-project">
-                <label>Current Project:</label>
-                <select id="global-project" onchange="onProjectChange()">
-                    <option value="">-- Select Project --</option>
-                </select>
+            <div style="display: flex; align-items: center; gap: 15px;">
+                <div class="global-project">
+                    <label>Current Project:</label>
+                    <select id="global-project" onchange="onProjectChange()">
+                        <option value="">-- Select Project --</option>
+                    </select>
+                </div>
+                <button onclick="openConfigModal()" style="padding: 8px 12px; background: #16213e; border: 1px solid #333; font-size: 1.2em;" title="Settings">⚙️</button>
             </div>
         </div>
 
@@ -330,7 +356,6 @@ def index():
             <button class="tab" onclick="showPanel('vector')">Vector Search</button>
             <button class="tab" onclick="showPanel('knowledge')">Knowledge</button>
             <button class="tab" onclick="showPanel('logs')">Logs</button>
-            <button class="tab" onclick="showPanel('config')">Config</button>
             <button class="tab" onclick="showPanel('debug')">Debug</button>
         </div>
 
@@ -387,17 +412,24 @@ def index():
         <div id="logs" class="panel">
             <h2>Hook Logs</h2>
             <button onclick="loadLogs()">Refresh</button>
-            <div id="log-list" style="margin-top: 15px; max-height: 600px; overflow-y: auto;"></div>
+            <div id="log-list" style="margin-top: 15px;"></div>
         </div>
 
-        <!-- Config Panel -->
-        <div id="config" class="panel">
-            <h2>Configuration</h2>
-            <div class="card">
-                <div id="config-form"></div>
-                <div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #333;">
+        <!-- Config Modal -->
+        <div id="config-modal" class="modal" style="display: none;">
+            <div class="modal-overlay" onclick="closeConfigModal()"></div>
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 style="margin: 0; color: #00d9ff;">Settings</h2>
+                    <button onclick="closeConfigModal()" style="background: none; border: none; color: #888; font-size: 1.5em; cursor: pointer;">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <div id="config-form"></div>
+                </div>
+                <div class="modal-footer">
                     <button onclick="saveAllConfig()" style="padding: 12px 30px; font-size: 1.1em;">Save All Settings</button>
                     <button onclick="resetConfig()" style="background: #e94560; margin-left: 10px;">Reset to Defaults</button>
+                    <button onclick="closeConfigModal()" style="background: #333; margin-left: 10px;">Cancel</button>
                 </div>
             </div>
         </div>
@@ -412,11 +444,11 @@ def index():
             </div>
             <div class="card" style="margin-top: 15px;">
                 <h3>Unsummarized Messages (<span id="debug-msg-count">0</span>)</h3>
-                <div id="debug-messages" style="max-height: 300px; overflow-y: auto;"></div>
+                <div id="debug-messages"></div>
             </div>
             <div class="card" style="margin-top: 15px;">
                 <h3>Full Prompt Sent to LLM</h3>
-                <pre id="debug-prompt" style="background: #1a1a2e; padding: 15px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; max-height: 400px; overflow-y: auto; font-size: 0.9em;"></pre>
+                <pre id="debug-prompt" style="background: #1a1a2e; padding: 15px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; font-size: 0.9em;"></pre>
             </div>
         </div>
 
@@ -637,6 +669,15 @@ def index():
         let configMeta = {};
         let configDefaults = {};
 
+        function openConfigModal() {
+            document.getElementById('config-modal').style.display = 'block';
+            loadConfig();
+        }
+
+        function closeConfigModal() {
+            document.getElementById('config-modal').style.display = 'none';
+        }
+
         async function loadConfig() {
             const res = await fetch('/api/config');
             const data = await res.json();
@@ -644,7 +685,7 @@ def index():
             configDefaults = data.defaults || {};
             const config = data.config || {};
 
-            const configKeys = ['short_term_window_size', 'max_context_tokens', 'summary_trigger_threshold', 'llm_provider', 'ollama_model', 'ollama_base_url', 'ollama_timeout', 'ollama_keep_alive', 'anthropic_model', 'embedding_model', 'enable_vector_search', 'enable_knowledge_extraction'];
+            const configKeys = ['short_term_window_size', 'max_context_tokens', 'summary_trigger_threshold', 'llm_provider', 'ollama_model', 'ollama_base_url', 'ollama_timeout', 'ollama_keep_alive', 'anthropic_model', 'embedding_model', 'enable_vector_search', 'enable_knowledge_extraction', 'input_token_price', 'output_token_price', 'inject_summary_count', 'inject_recent_count', 'inject_preview_length', 'inject_knowledge_count', 'inject_task_count'];
             let html = '';
             for (const key of configKeys) {
                 const meta = configMeta[key] || {label: key, description: '', type: 'text'};
@@ -669,7 +710,7 @@ def index():
         }
 
         async function saveAllConfig() {
-            const configKeys = ['short_term_window_size', 'max_context_tokens', 'summary_trigger_threshold', 'llm_provider', 'ollama_model', 'ollama_base_url', 'ollama_timeout', 'ollama_keep_alive', 'anthropic_model', 'embedding_model', 'enable_vector_search', 'enable_knowledge_extraction'];
+            const configKeys = ['short_term_window_size', 'max_context_tokens', 'summary_trigger_threshold', 'llm_provider', 'ollama_model', 'ollama_base_url', 'ollama_timeout', 'ollama_keep_alive', 'anthropic_model', 'embedding_model', 'enable_vector_search', 'enable_knowledge_extraction', 'input_token_price', 'output_token_price', 'inject_summary_count', 'inject_recent_count', 'inject_preview_length', 'inject_knowledge_count', 'inject_task_count'];
             for (const key of configKeys) {
                 const el = document.getElementById(`config-${key}`);
                 if (el) {
@@ -677,7 +718,7 @@ def index():
                 }
             }
             alert('Settings saved!');
-            loadConfig();
+            closeConfigModal();
         }
 
         async function resetConfig() {
@@ -715,13 +756,12 @@ def index():
         }
 
         async function refreshAll() {
-            // Config/Debug/Vector/Knowledge 页面不自动刷新
-            if (currentPanel === 'config' || currentPanel === 'debug' || currentPanel === 'vector' || currentPanel === 'knowledge') {
+            // Debug/Vector/Knowledge 页面不自动刷新
+            if (currentPanel === 'debug' || currentPanel === 'vector' || currentPanel === 'knowledge') {
                 return;
             }
             await loadProjects();
             loadProjectData();
-            loadConfig();
         }
 
         async function searchVector() {

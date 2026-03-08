@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from loguru import logger
-from src.memory_core import MemoryManager
+from src.memory_core import MemoryManager, TokenUsage, Database
 from src.memory_core.config import load_config
 
 # 路径配置
@@ -58,6 +58,43 @@ def is_real_user_message(msg: dict) -> bool:
         if isinstance(first_item, dict) and first_item.get("type") == "tool_result":
             return False
     return True
+
+
+def extract_token_usage_from_transcript(transcript_path: str) -> dict:
+    """从 transcript 文件中提取 token 使用信息"""
+    total_input = 0
+    total_output = 0
+    model = ""
+
+    try:
+        path = Path(transcript_path)
+        if not path.exists():
+            return {"input_tokens": 0, "output_tokens": 0, "model": ""}
+
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                    # Claude Code transcript 中 assistant 消息包含 usage 信息
+                    if msg.get("type") == "assistant" and "message" in msg:
+                        inner_msg = msg.get("message", {})
+                        usage = inner_msg.get("usage", {})
+                        if usage:
+                            total_input += usage.get("input_tokens", 0)
+                            total_output += usage.get("output_tokens", 0)
+                        if not model:
+                            model = inner_msg.get("model", "")
+                except json.JSONDecodeError:
+                    continue
+
+        logger.debug(f"Token usage from transcript: input={total_input}, output={total_output}, model={model}")
+        return {"input_tokens": total_input, "output_tokens": total_output, "model": model}
+    except Exception as e:
+        logger.error(f"Error extracting token usage: {e}")
+        return {"input_tokens": 0, "output_tokens": 0, "model": ""}
 
 
 def extract_assistant_response_from_transcript(transcript_path: str) -> str:
@@ -182,13 +219,18 @@ def main():
 
     # 优先使用 last_assistant_message（Claude Code 直接提供）
     response = input_data.get("last_assistant_message", "")
+    transcript_path = input_data.get("transcript_path", "")
 
     # 如果没有，尝试从 transcript 提取
-    if not response:
-        transcript_path = input_data.get("transcript_path", "")
-        if transcript_path:
-            logger.info(f"No last_assistant_message, extracting from transcript: {transcript_path}")
-            response = extract_assistant_response_from_transcript(transcript_path)
+    if not response and transcript_path:
+        logger.info(f"No last_assistant_message, extracting from transcript: {transcript_path}")
+        response = extract_assistant_response_from_transcript(transcript_path)
+
+    # 提取 token 使用信息
+    token_usage_data = {"input_tokens": 0, "output_tokens": 0, "model": ""}
+    if transcript_path:
+        token_usage_data = extract_token_usage_from_transcript(transcript_path)
+        logger.info(f"Token usage: input={token_usage_data['input_tokens']}, output={token_usage_data['output_tokens']}")
 
     logger.info(f"Project: {project_name}, Session: {session_id}")
     logger.info(f"Stop reason: {stop_reason}, Response length: {len(response)}")
@@ -222,20 +264,31 @@ def main():
         else:
             logger.warning("Empty response, skipping save")
 
-        # 处理会话结束
+        # 3. 保存 token 使用信息
+        if token_usage_data["input_tokens"] > 0 or token_usage_data["output_tokens"] > 0:
+            from datetime import datetime
+            usage = TokenUsage(
+                id=None,
+                session_id=session_id,
+                input_tokens=token_usage_data["input_tokens"],
+                output_tokens=token_usage_data["output_tokens"],
+                model=token_usage_data["model"],
+                timestamp=datetime.now()
+            )
+            # 保存到项目数据库
+            project_db_obj = Database(project_db)
+            project_db_obj.add_token_usage(usage)
+            # 保存到全局数据库
+            usage.session_id = global_session_id
+            global_db_obj = Database(GLOBAL_DB)
+            global_db_obj.add_token_usage(usage)
+            logger.info(f"Token usage saved: input={usage.input_tokens}, output={usage.output_tokens}")
+
+        # 处理会话结束（知识提取已在 trigger_summary 中自动完成）
         if stop_reason == "end_session":
             logger.info("End session requested")
 
-            # 提取结构化知识（在总结之前）
-            try:
-                knowledge = project_manager.extract_knowledge(session_id)
-                if knowledge:
-                    total_items = sum(len(v) for v in knowledge.values())
-                    logger.info(f"[Project] Extracted knowledge: {total_items} items")
-            except Exception as e:
-                logger.warning(f"Knowledge extraction failed: {e}")
-
-            # 项目级会话结束
+            # 项目级会话结束（会自动触发总结和知识提取）
             project_summary = project_manager.end_session(session_id)
             if project_summary:
                 logger.info(f"[Project] Session ended with summary: id={project_summary.id}")

@@ -149,6 +149,14 @@ def main():
         config_kwargs = config_mgr.get_memory_manager_kwargs()
         logger.info(f"Loaded config: window={config_kwargs['short_term_window_size']}, threshold={config_kwargs['summary_trigger_threshold']}, llm={config_kwargs['llm_provider']}")
 
+        # 读取注入相关配置
+        inject_summary_count = config_mgr.get_int("inject_summary_count")
+        inject_recent_count = config_mgr.get_int("inject_recent_count")
+        inject_preview_length = config_mgr.get_int("inject_preview_length")
+        inject_knowledge_count = config_mgr.get_int("inject_knowledge_count")
+        inject_task_count = config_mgr.get_int("inject_task_count")
+        logger.info(f"Inject config: summaries={inject_summary_count}, recent={inject_recent_count}, preview_len={inject_preview_length}")
+
         # 1. 加载项目级记忆（跨会话）
         project_db = get_project_db_path(project_name)
         project_manager = MemoryManager(db_path=project_db, **config_kwargs)
@@ -159,8 +167,8 @@ def main():
 
         # 如果当前会话没有内容，获取所有会话的摘要和最近消息
         if not project_context["summaries"] and not project_context["messages"]:
-            all_summaries = project_manager.db.get_all_summaries(limit=5)
-            recent_messages = project_manager.db.get_recent_messages_all_sessions(limit=10)
+            all_summaries = project_manager.db.get_all_summaries(limit=inject_summary_count)
+            recent_messages = project_manager.db.get_recent_messages_all_sessions(limit=inject_recent_count)
 
             if all_summaries:
                 project_context["summaries"] = "\n\n---\n\n".join(s.summary_text for s in all_summaries)
@@ -172,20 +180,24 @@ def main():
             if project_context["summaries"]:
                 output_parts.append(f"# [{project_name}] 项目历史摘要:\n{project_context['summaries']}")
             if project_context["messages"]:
-                recent = "\n".join(f"- {m['role']}: {m['content'][:200]}" for m in project_context["messages"][-5:])
+                def truncate(text, max_len):
+                    if max_len <= 0 or len(text) <= max_len:
+                        return text
+                    return text[:max_len] + "..."
+                recent = "\n".join(f"- {m['role']}: {truncate(m['content'], inject_preview_length)}" for m in project_context["messages"])
                 output_parts.append(f"# [{project_name}] 最近对话:\n{recent}")
 
         # 2. 加载结构化知识（所有会话）
         knowledge = project_manager.get_knowledge(None)  # None = 获取所有会话的知识
         knowledge_items = []
         if knowledge.get("user_preferences"):
-            knowledge_items.append(f"用户偏好: {', '.join(knowledge['user_preferences'][:5])}")
+            knowledge_items.append(f"用户偏好: {', '.join(knowledge['user_preferences'][:inject_knowledge_count])}")
         if knowledge.get("project_decisions"):
-            knowledge_items.append(f"项目决策: {', '.join(knowledge['project_decisions'][:5])}")
+            knowledge_items.append(f"项目决策: {', '.join(knowledge['project_decisions'][:inject_knowledge_count])}")
         if knowledge.get("key_facts"):
-            knowledge_items.append(f"关键事实: {', '.join(knowledge['key_facts'][:5])}")
+            knowledge_items.append(f"关键事实: {', '.join(knowledge['key_facts'][:inject_knowledge_count])}")
         if knowledge.get("pending_tasks"):
-            knowledge_items.append(f"待办事项: {', '.join(knowledge['pending_tasks'][:3])}")
+            knowledge_items.append(f"待办事项: {', '.join(knowledge['pending_tasks'][:inject_task_count])}")
 
         if knowledge_items:
             output_parts.append(f"# [{project_name}] 累积知识:\n" + "\n".join(f"- {item}" for item in knowledge_items))

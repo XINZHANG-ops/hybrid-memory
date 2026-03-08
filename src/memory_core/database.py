@@ -3,7 +3,7 @@ from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime
 from loguru import logger
-from .models import Message, Summary, Session
+from .models import Message, Summary, Session, TokenUsage
 
 DEFAULT_DB_PATH = Path(__file__).parent.parent.parent / "data" / "memory.db"
 
@@ -52,11 +52,23 @@ CREATE TABLE IF NOT EXISTS knowledge (
     UNIQUE(session_id, category, content)
 );
 
+CREATE TABLE IF NOT EXISTS token_usage (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    model TEXT DEFAULT '',
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_session ON knowledge(session_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_category ON knowledge(category);
 CREATE INDEX IF NOT EXISTS idx_messages_summarized ON messages(is_summarized);
 CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_session ON token_usage(session_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
 """
 
 
@@ -170,15 +182,21 @@ class Database:
             logger.debug(f"Retrieved {len(messages)} messages for session {session_id}")
             return messages
 
-    def get_unsummarized_messages(self, session_id: str) -> list[Message]:
+    def get_unsummarized_messages(self, session_id: str | None = None) -> list[Message]:
+        """获取未总结消息。session_id=None 时获取所有 session 的未总结消息"""
         logger.debug(f"Getting unsummarized messages: session={session_id}")
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM messages WHERE session_id = ? AND is_summarized = 0 ORDER BY id ASC",
-                (session_id,),
-            ).fetchall()
+            if session_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM messages WHERE is_summarized = 0 ORDER BY id ASC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ? AND is_summarized = 0 ORDER BY id ASC",
+                    (session_id,),
+                ).fetchall()
             messages = [self._row_to_message(row) for row in rows]
-            logger.debug(f"Retrieved {len(messages)} unsummarized messages for session {session_id}")
+            logger.debug(f"Retrieved {len(messages)} unsummarized messages for {session_id or 'ALL'}")
             return messages
 
     def mark_messages_summarized(self, message_ids: list[int]):
@@ -194,15 +212,21 @@ class Database:
             )
         logger.info(f"Marked {len(message_ids)} messages as summarized")
 
-    def count_unsummarized_messages(self, session_id: str) -> int:
+    def count_unsummarized_messages(self, session_id: str | None = None) -> int:
+        """计数未总结消息。session_id=None 时统计所有 session"""
         logger.debug(f"Counting unsummarized messages: session={session_id}")
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM messages WHERE session_id = ? AND is_summarized = 0",
-                (session_id,),
-            ).fetchone()
+            if session_id is None:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE is_summarized = 0"
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ? AND is_summarized = 0",
+                    (session_id,),
+                ).fetchone()
             count = row[0]
-            logger.debug(f"Unsummarized message count for {session_id}: {count}")
+            logger.debug(f"Unsummarized message count for {session_id or 'ALL'}: {count}")
             return count
 
     def add_summary(self, summary: Summary) -> Summary:
@@ -389,3 +413,64 @@ class Database:
         total = sum(len(v) for v in result.values())
         logger.debug(f"Retrieved {total} knowledge items")
         return result
+
+    def add_token_usage(self, usage: TokenUsage) -> TokenUsage:
+        logger.debug(f"Adding token usage: session={usage.session_id}, input={usage.input_tokens}, output={usage.output_tokens}")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """INSERT INTO token_usage (session_id, input_tokens, output_tokens, model, timestamp)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (usage.session_id, usage.input_tokens, usage.output_tokens, usage.model, usage.timestamp),
+            )
+            usage.id = cursor.lastrowid
+            logger.info(f"Token usage added: id={usage.id}, input={usage.input_tokens}, output={usage.output_tokens}")
+            return usage
+
+    def get_token_usage_stats(self, session_id: str | None = None) -> dict:
+        logger.debug(f"Getting token usage stats: session={session_id}")
+        with self._connect() as conn:
+            if session_id:
+                row = conn.execute(
+                    """SELECT SUM(input_tokens) as total_input, SUM(output_tokens) as total_output, COUNT(*) as count
+                       FROM token_usage WHERE session_id = ?""",
+                    (session_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT SUM(input_tokens) as total_input, SUM(output_tokens) as total_output, COUNT(*) as count
+                       FROM token_usage"""
+                ).fetchone()
+            stats = {
+                "total_input_tokens": row["total_input"] or 0,
+                "total_output_tokens": row["total_output"] or 0,
+                "request_count": row["count"] or 0,
+            }
+            logger.debug(f"Token stats: {stats}")
+            return stats
+
+    def get_token_usage_history(self, session_id: str | None = None, limit: int = 100) -> list[TokenUsage]:
+        logger.debug(f"Getting token usage history: session={session_id}, limit={limit}")
+        with self._connect() as conn:
+            if session_id:
+                rows = conn.execute(
+                    "SELECT * FROM token_usage WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
+                    (session_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM token_usage ORDER BY timestamp DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            usages = [self._row_to_token_usage(row) for row in rows]
+            logger.debug(f"Retrieved {len(usages)} token usage records")
+            return usages
+
+    def _row_to_token_usage(self, row: sqlite3.Row) -> TokenUsage:
+        return TokenUsage(
+            id=row["id"],
+            session_id=row["session_id"],
+            input_tokens=row["input_tokens"],
+            output_tokens=row["output_tokens"],
+            model=row["model"] or "",
+            timestamp=row["timestamp"] if isinstance(row["timestamp"], datetime) else datetime.fromisoformat(row["timestamp"]),
+        )

@@ -12,14 +12,14 @@ EXTRACTION_PROMPT = """你是一个知识提取助手。请从以下对话中提
 ## 请提取以下类型的知识（JSON格式）：
 
 ```json
-{
+{{
   "user_preferences": ["用户的偏好和习惯，如编码风格、沟通方式等"],
   "project_decisions": ["项目中做出的重要技术决策和架构选择"],
   "key_facts": ["需要记住的关键事实，如项目名、技术栈、用户名等"],
   "pending_tasks": ["提到但未完成的任务或待办事项"],
   "learned_patterns": ["观察到的用户行为模式或工作方式"],
   "important_context": ["其他重要的上下文信息"]
-}
+}}
 ```
 
 注意：

@@ -126,12 +126,26 @@ class MemoryManager:
         return results
 
     def trigger_summary(self, session_id: str) -> Summary | None:
+        """触发总结。获取所有未总结消息（跨 session），总结存储到当前 session_id。同时提取知识。"""
         logger.info(f"Triggering summary for session: {session_id}")
-        messages = self.db.get_unsummarized_messages(session_id)
+        # 跨所有 session 获取未总结消息，避免新开会话导致消息被忽略
+        messages = self.db.get_unsummarized_messages(None)
         if not messages:
             logger.debug("No unsummarized messages to summarize")
             return None
-        logger.debug(f"Summarizing {len(messages)} messages")
+        logger.info(f"Summarizing {len(messages)} messages across all sessions")
+
+        # 在总结前提取知识（使用相同的消息）
+        if self.enable_knowledge_extraction and self.knowledge_extractor:
+            try:
+                knowledge = self.knowledge_extractor.extract(messages)
+                if knowledge:
+                    self.db.save_knowledge(session_id, knowledge)
+                    total_items = sum(len(v) for v in knowledge.values())
+                    logger.info(f"Extracted {total_items} knowledge items during summary")
+            except Exception as e:
+                logger.warning(f"Knowledge extraction during summary failed: {e}")
+
         return self.long_term.create_summary(session_id, messages)
 
     def end_session(self, session_id: str) -> Summary | None:
