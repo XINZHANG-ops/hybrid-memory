@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__plugin_claude-mem_mcp-search__timeline",
+      "mcp__plugin_claude-mem_mcp-search__search",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(python -c:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(curl:*)",
+      "Bash(taskkill:*)",
+      "Bash(taskkill /F /FI \"IMAGENAME eq python.exe\" /FI \"COMMANDLINE eq *dashboard*\")",
+      "Bash(netstat:*)",
+      "Bash(findstr:*)",
+      "Bash(powershell -Command \"Stop-Process -Id 125444 -Force; Stop-Process -Id 107496 -Force\")",
+      "Bash(start /B python src/http_api/dashboard.py)",
+      "Bash(powershell -Command \"Start-Process python -ArgumentList ''D:/python/hybrid-memory/src/http_api/dashboard.py'' -WindowStyle Hidden\")",
+      "Bash(powershell -Command \"Start-Sleep -Seconds 2; curl http://localhost:37888/api/projects/hybrid-memory/messages?limit=2\")",
+      "Bash(tasklist:*)",
+      "Bash(cmd /c \"taskkill /F /PID 140888\")",
+      "Bash(uv run:*)",
+      "Bash(powershell -Command \"Stop-Process -Id 140888 -Force; Stop-Process -Id 107404 -Force\")",
+      "Bash(powershell -Command:*)",
+      "Bash(pip show:*)",
+      "Bash(timeout /t:*)",
+      "Bash(start:*)",
+      "Bash(more:*)",
+      "Bash(echo:*)",
+      "Bash(ping:*)",
+      "Bash(powershell \"Stop-Process -Name python -Force -ErrorAction SilentlyContinue\")",
+      "Bash(powershell \"Start-Sleep -Seconds 3\")",
+      "Bash(powershell \"\\(Get-Process python | Where-Object { $_Id -ne $PID } | Select-Object -First 1\\).Id\")",
+      "Bash(powershell -NoProfile -Command:*)",
+      "Bash(dir:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}
