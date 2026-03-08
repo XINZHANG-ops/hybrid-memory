@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from loguru import logger
-from src.memory_core import MemoryManager, TokenUsage, Database
+from src.memory_core import MemoryManager, TokenUsage, Database, publish_event
 from src.memory_core.config import load_config
 
 # 路径配置
@@ -98,7 +98,11 @@ def extract_token_usage_from_transcript(transcript_path: str) -> dict:
 
 
 def extract_assistant_response_from_transcript(transcript_path: str) -> str:
-    """从 transcript 文件中提取最新一轮完整的 assistant 回复（包括所有工具调用）"""
+    """从 transcript 文件中提取最新一轮完整的 assistant 回复
+
+    返回 JSON 格式的内容块数组，便于前端结构化渲染：
+    [{"type": "thinking", "content": "..."}, {"type": "tool", "name": "Read", "content": "..."}, {"type": "text", "content": "..."}]
+    """
     try:
         path = Path(transcript_path)
         if not path.exists():
@@ -131,8 +135,8 @@ def extract_assistant_response_from_transcript(transcript_path: str) -> str:
 
         logger.debug(f"Last real user message at index {last_real_user_idx}, collecting all responses after")
 
-        # 收集最后一个真正用户消息之后的所有 assistant 内容
-        response_parts = []
+        # 收集结构化的内容块
+        content_blocks = []
         for msg in messages[last_real_user_idx + 1:]:
             msg_type = msg.get("type", "")
 
@@ -143,49 +147,47 @@ def extract_assistant_response_from_transcript(transcript_path: str) -> str:
                 logger.debug(f"Found assistant message with {len(content) if isinstance(content, list) else 1} content items")
 
                 if isinstance(content, str):
-                    response_parts.append(content)
+                    content_blocks.append({"type": "text", "content": content})
                 elif isinstance(content, list):
                     for part in content:
                         part_type = part.get("type", "") if isinstance(part, dict) else "string"
                         logger.debug(f"Processing content part: type={part_type}")
 
                         if isinstance(part, str):
-                            response_parts.append(part)
+                            content_blocks.append({"type": "text", "content": part})
                         elif isinstance(part, dict):
                             if part_type == "text":
                                 text = part.get("text", "")
                                 if text:
-                                    response_parts.append(text)
+                                    content_blocks.append({"type": "text", "content": text})
                             elif part_type == "tool_use":
                                 tool_name = part.get("name", "unknown")
                                 tool_input = part.get("input", {})
-                                # 对于代码编辑工具，提取关键信息
+                                # 格式化工具调用内容
                                 if tool_name in ("Edit", "Write"):
                                     file_path = tool_input.get("file_path", "")
                                     if tool_name == "Edit":
-                                        old_str = tool_input.get("old_string", "")[:100]
-                                        new_str = tool_input.get("new_string", "")[:300]
-                                        response_parts.append(f"[Tool: {tool_name}] {file_path}\n  旧: {old_str}...\n  新: {new_str}...")
+                                        old_str = tool_input.get("old_string", "")
+                                        new_str = tool_input.get("new_string", "")
+                                        tool_content = f"{file_path}\nold: {old_str}\nnew: {new_str}"
                                     else:
-                                        content_preview = tool_input.get("content", "")[:300]
-                                        response_parts.append(f"[Tool: {tool_name}] {file_path}\n  内容: {content_preview}...")
+                                        content_full = tool_input.get("content", "")
+                                        tool_content = f"{file_path}\ncontent: {content_full}"
                                 elif tool_name == "Bash":
-                                    cmd = tool_input.get("command", "")[:200]
-                                    response_parts.append(f"[Tool: Bash] {cmd}")
+                                    tool_content = tool_input.get("command", "")
                                 elif tool_name == "Read":
-                                    file_path = tool_input.get("file_path", "")
-                                    response_parts.append(f"[Tool: Read] {file_path}")
+                                    tool_content = tool_input.get("file_path", "")
                                 else:
-                                    input_str = json.dumps(tool_input, ensure_ascii=False)[:300]
-                                    response_parts.append(f"[Tool: {tool_name}] {input_str}")
+                                    tool_content = json.dumps(tool_input, ensure_ascii=False)
+                                content_blocks.append({"type": "tool", "name": tool_name, "content": tool_content})
                             elif part_type == "thinking":
-                                # 简短记录思考过程
-                                thinking = part.get("thinking", "")[:150]
+                                thinking = part.get("thinking", "")
                                 if thinking:
-                                    response_parts.append(f"[思考] {thinking}...")
+                                    content_blocks.append({"type": "thinking", "content": thinking})
 
-        result = "\n".join(response_parts)
-        logger.info(f"Extracted assistant response: {len(result)} chars from {len(response_parts)} parts")
+        # 返回 JSON 格式的结构化数据
+        result = json.dumps(content_blocks, ensure_ascii=False)
+        logger.info(f"Extracted {len(content_blocks)} content blocks")
         return result
     except Exception as e:
         logger.error(f"Error extracting from transcript: {e}")
@@ -253,6 +255,8 @@ def main():
             response = sanitize_text(response)
             logger.debug(f"Response preview: {response[:100]}...")
 
+            publish_event("message", f"Saving message ({len(response)} chars)", project_name)
+
             # 1. 保存到项目级数据库
             project_msg = project_manager.add_message(session_id, "assistant", response)
             logger.info(f"[Project] Assistant message saved: id={project_msg.id}")
@@ -287,11 +291,13 @@ def main():
         # 处理会话结束（知识提取已在 trigger_summary 中自动完成）
         if stop_reason == "end_session":
             logger.info("End session requested")
+            publish_event("session_end", f"Session ending: {project_name}", "Triggering summary & knowledge extraction")
 
             # 项目级会话结束（会自动触发总结和知识提取）
             project_summary = project_manager.end_session(session_id)
             if project_summary:
                 logger.info(f"[Project] Session ended with summary: id={project_summary.id}")
+                publish_event("summary_done", f"Summary created: #{project_summary.id}", project_name)
 
             # 全局会话结束
             global_summary = global_manager.end_session(global_session_id)

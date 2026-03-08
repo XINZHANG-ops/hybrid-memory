@@ -1,3 +1,4 @@
+import re
 from loguru import logger
 from .database import Database
 from .models import Message
@@ -7,6 +8,13 @@ try:
     FUZZY_AVAILABLE = True
 except ImportError:
     FUZZY_AVAILABLE = False
+
+try:
+    from rank_bm25 import BM25Okapi
+    import jieba
+    BM25_AVAILABLE = True
+except ImportError:
+    BM25_AVAILABLE = False
 
 
 class MemoryRetriever:
@@ -41,3 +49,42 @@ class MemoryRetriever:
         messages = self.db.get_messages(session_id, include_summarized=include_summarized)
         logger.debug(f"Retrieved {len(messages)} messages")
         return messages
+
+    def bm25_search(self, query: str, session_id: str | None = None, limit: int = 20) -> list[tuple[Message, float]]:
+        """使用 BM25 算法搜索消息，返回 (消息, 分数) 列表"""
+        if not BM25_AVAILABLE:
+            logger.warning("BM25 not available, falling back to fuzzy search")
+            results = self._fuzzy_search(query, session_id, limit, threshold=30)
+            return [(msg, 0.5) for msg in results]
+
+        logger.debug(f"Performing BM25 search: query='{query}', session={session_id}")
+        all_messages = self.db.get_all_messages_for_search(session_id)
+        if not all_messages:
+            return []
+
+        # 分词：中英文混合分词
+        def tokenize(text: str) -> list[str]:
+            # 先用 jieba 分词
+            tokens = list(jieba.cut(text.lower()))
+            # 过滤掉空白和标点
+            tokens = [t.strip() for t in tokens if t.strip() and len(t.strip()) > 0]
+            return tokens
+
+        # 构建语料库
+        corpus = [tokenize(msg.content) for msg in all_messages]
+        query_tokens = tokenize(query)
+
+        if not query_tokens or not any(corpus):
+            return []
+
+        # 创建 BM25 实例并搜索
+        bm25 = BM25Okapi(corpus)
+        scores = bm25.get_scores(query_tokens)
+
+        # 按分数排序
+        scored_messages = [(msg, score) for msg, score in zip(all_messages, scores) if score > 0]
+        scored_messages.sort(key=lambda x: x[1], reverse=True)
+
+        results = scored_messages[:limit]
+        logger.info(f"BM25 search completed: {len(results)} results")
+        return results

@@ -10,6 +10,7 @@ from .models import Message, Summary
 from .embedding_client import EmbeddingClient
 from .vector_store import VectorStore
 from .knowledge_extractor import KnowledgeExtractor
+from .events import publish_event
 
 
 class MemoryManager:
@@ -30,6 +31,15 @@ class MemoryManager:
         embedding_model: str = "embeddinggemma:300m",
         enable_vector_search: bool = True,
         enable_knowledge_extraction: bool = True,
+        # 总结配置
+        summary_max_chars_total: int = 8000,
+        summary_max_chars_per_message: int = 500,
+        # 知识提取配置
+        knowledge_max_chars_per_message: int = 500,
+        # Prompt 模板
+        summary_prompt_template: str = "",
+        knowledge_extraction_prompt: str = "",
+        knowledge_condense_prompt: str = "",
     ):
         logger.info("Initializing MemoryManager")
         logger.debug(f"Config: db_path={db_path}, llm_provider={llm_provider}, window_size={short_term_window_size}, max_tokens={max_context_tokens}, trigger_threshold={summary_trigger_threshold}")
@@ -53,11 +63,21 @@ class MemoryManager:
         self.short_term = ShortTermMemory(
             self.db, window_size=short_term_window_size, max_tokens=max_context_tokens
         )
-        self.summarizer = SummaryGenerator(self._llm)
+        self.summarizer = SummaryGenerator(
+            self._llm,
+            max_chars_total=summary_max_chars_total,
+            max_chars_per_message=summary_max_chars_per_message,
+        )
         self.long_term = LongTermMemory(
             self.db, self.summarizer, trigger_threshold=summary_trigger_threshold
         )
         self.retriever = MemoryRetriever(self.db)
+
+        # 保存配置供其他模块使用
+        self.knowledge_max_chars_per_message = knowledge_max_chars_per_message
+        self.summary_prompt_template = summary_prompt_template
+        self.knowledge_extraction_prompt = knowledge_extraction_prompt
+        self.knowledge_condense_prompt = knowledge_condense_prompt
 
         # 向量检索
         self.enable_vector_search = enable_vector_search
@@ -76,7 +96,12 @@ class MemoryManager:
         self.enable_knowledge_extraction = enable_knowledge_extraction
         self.knowledge_extractor = None
         if enable_knowledge_extraction:
-            self.knowledge_extractor = KnowledgeExtractor(self._llm)
+            self.knowledge_extractor = KnowledgeExtractor(
+                self._llm,
+                max_chars_per_message=knowledge_max_chars_per_message,
+                extraction_prompt=knowledge_extraction_prompt,
+                condense_prompt=knowledge_condense_prompt,
+            )
             logger.info("Knowledge extraction enabled")
 
         logger.info("MemoryManager initialization complete")
@@ -84,6 +109,8 @@ class MemoryManager:
     def start_session(self, session_id: str):
         logger.info(f"Starting session: {session_id}")
         self.db.create_session(session_id)
+        # Resume 时也更新活动时间，确保时间显示为最新
+        self.db.update_session_activity(session_id)
 
     def add_message(self, session_id: str, role: str, content: str) -> Message:
         logger.debug(f"MemoryManager.add_message: session={session_id}, role={role}")
@@ -95,11 +122,13 @@ class MemoryManager:
         # 实时生成 embedding 并索引
         if self.enable_vector_search and self.embedding_client and self.vector_store:
             try:
+                publish_event("embedding", f"Generating embedding for message #{message.id}", "")
                 embedding = self.embedding_client.embed(content)
                 self.vector_store.add(message.id, embedding)
                 logger.debug(f"Message {message.id} indexed in vector store")
             except Exception as e:
                 logger.warning(f"Failed to index message: {e}")
+                publish_event("error", f"Embedding failed: {e}", "")
 
         if self.long_term.should_summarize(session_id):
             logger.info(f"Summary threshold reached for session {session_id}, triggering summarization")
@@ -135,18 +164,29 @@ class MemoryManager:
             return None
         logger.info(f"Summarizing {len(messages)} messages across all sessions")
 
-        # 在总结前提取知识（使用相同的消息）
+        # 在总结前提取知识（使用相同的消息，并传入已有知识避免重复）
         if self.enable_knowledge_extraction and self.knowledge_extractor:
             try:
-                knowledge = self.knowledge_extractor.extract(messages)
-                if knowledge:
-                    self.db.save_knowledge(session_id, knowledge)
-                    total_items = sum(len(v) for v in knowledge.values())
-                    logger.info(f"Extracted {total_items} knowledge items during summary")
+                publish_event("knowledge", f"Extracting knowledge from {len(messages)} messages", "Sending to LLM...")
+                existing_knowledge = self.db.get_knowledge()
+                new_knowledge = self.knowledge_extractor.extract(messages, existing_knowledge)
+                if new_knowledge:
+                    # 合并新旧知识
+                    merged = self.knowledge_extractor.merge_knowledge(existing_knowledge, new_knowledge)
+                    self.db.save_knowledge(session_id, merged)
+                    new_items = sum(len(v) for v in new_knowledge.values())
+                    total_items = sum(len(v) for v in merged.values())
+                    logger.info(f"Extracted {new_items} new items, total {total_items} knowledge items")
+                    publish_event("knowledge_done", f"Extracted {new_items} new items (total: {total_items})", "")
             except Exception as e:
                 logger.warning(f"Knowledge extraction during summary failed: {e}")
+                publish_event("error", f"Knowledge extraction failed: {e}", "")
 
-        return self.long_term.create_summary(session_id, messages)
+        publish_event("summary", f"Generating summary for {len(messages)} messages", "Sending to LLM...")
+        summary = self.long_term.create_summary(session_id, messages)
+        if summary:
+            publish_event("summary_done", f"Summary created: #{summary.id}", f"{len(summary.summary_text)} chars")
+        return summary
 
     def end_session(self, session_id: str) -> Summary | None:
         logger.info(f"Ending session: {session_id}")
@@ -183,6 +223,10 @@ class MemoryManager:
         except Exception as e:
             logger.error(f"Vector search failed: {e}")
             return []
+
+    def bm25_search(self, query: str, session_id: str | None = None, limit: int = 20) -> list[tuple[Message, float]]:
+        """使用 BM25 算法搜索消息"""
+        return self.retriever.bm25_search(query, session_id, limit)
 
     def extract_knowledge(self, session_id: str) -> dict:
         """从最近的消息中提取结构化知识"""

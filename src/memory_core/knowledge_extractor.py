@@ -3,13 +3,37 @@ from loguru import logger
 from .models import Message
 from .llm_client import LLMClient
 
+# 默认值（可通过配置覆盖）
+DEFAULT_MAX_CHARS_PER_MESSAGE = 500
 
-EXTRACTION_PROMPT = """你是一个知识提取助手。请从以下对话中提取结构化的知识点。
 
-## 对话内容：
+CONDENSE_PROMPT = """你是一个知识精炼助手。以下是某个类别的知识条目列表，数量过多需要精炼。
+
+## 类别：{category_name}
+## 当前条目（{count}条）：
+{items}
+
+## 要求
+请将这些条目精炼为不超过 {max_count} 条，要求：
+1. 合并相似或重复的条目
+2. 保留最重要、最有价值的信息
+3. 删除过时或不再相关的内容
+4. 每条保持简洁明了
+
+请直接输出精炼后的条目列表（JSON数组格式），例如：
+["条目1", "条目2", "条目3"]
+
+只输出 JSON 数组，不要其他内容："""
+
+EXTRACTION_PROMPT = """你是一个知识提取助手。请从以下对话中提取**新的**结构化知识点。
+
+## 已有知识（不要重复这些）：
+{existing_knowledge}
+
+## 新对话内容：
 {conversation}
 
-## 请提取以下类型的知识（JSON格式）：
+## 请提取以下类型的**新**知识（JSON格式）：
 
 ```json
 {{
@@ -23,25 +47,49 @@ EXTRACTION_PROMPT = """你是一个知识提取助手。请从以下对话中提
 ```
 
 注意：
+- **不要重复已有知识中的内容**，只提取新信息
+- 如果新对话修正或更新了已有知识，提取更新后的版本
+- 如果某个待办事项已完成，可以在 pending_tasks 中标注"[已完成] xxx"
 - 只提取确实存在的信息，没有的字段留空数组
 - 每个条目应该简洁明了
-- 避免重复已知信息
 - 用中文输出
 
 请输出 JSON（只输出 JSON，不要其他内容）："""
 
 
 class KnowledgeExtractor:
-    def __init__(self, llm_client: LLMClient):
+    def __init__(
+        self,
+        llm_client: LLMClient,
+        max_chars_per_message: int = DEFAULT_MAX_CHARS_PER_MESSAGE,
+        extraction_prompt: str = "",
+        condense_prompt: str = "",
+    ):
         self.llm = llm_client
-        logger.info("KnowledgeExtractor initialized")
+        self.max_chars_per_message = max_chars_per_message
+        self.extraction_prompt = extraction_prompt
+        self.condense_prompt = condense_prompt
+        logger.info(f"KnowledgeExtractor initialized (max_per_msg={max_chars_per_message})")
 
-    def extract(self, messages: list[Message]) -> dict:
+    def extract(self, messages: list[Message], existing_knowledge: dict | None = None) -> dict:
         if not messages:
             return self._empty_knowledge()
 
         conversation = self._format_conversation(messages)
-        prompt = EXTRACTION_PROMPT.format(conversation=conversation)
+        existing_str = self._format_existing_knowledge(existing_knowledge)
+
+        if self.extraction_prompt and self.extraction_prompt.strip():
+            try:
+                prompt = self.extraction_prompt.format(
+                    conversation=conversation,
+                    existing_knowledge=existing_str
+                )
+                logger.debug("Using custom extraction prompt")
+            except KeyError as e:
+                logger.warning(f"Custom extraction prompt format error: {e}, falling back to default")
+                prompt = EXTRACTION_PROMPT.format(conversation=conversation, existing_knowledge=existing_str)
+        else:
+            prompt = EXTRACTION_PROMPT.format(conversation=conversation, existing_knowledge=existing_str)
 
         try:
             response = self.llm.generate(prompt)
@@ -52,11 +100,30 @@ class KnowledgeExtractor:
             logger.error(f"Knowledge extraction failed: {e}")
             return self._empty_knowledge()
 
+    def _format_existing_knowledge(self, knowledge: dict | None) -> str:
+        if not knowledge:
+            return "(无已有知识)"
+        lines = []
+        category_names = {
+            "user_preferences": "用户偏好",
+            "project_decisions": "项目决策",
+            "key_facts": "关键事实",
+            "pending_tasks": "待办事项",
+            "learned_patterns": "行为模式",
+            "important_context": "重要上下文",
+        }
+        for key, items in knowledge.items():
+            if items:
+                name = category_names.get(key, key)
+                lines.append(f"- {name}: {', '.join(items[:10])}")  # 最多显示10条
+        return "\n".join(lines) if lines else "(无已有知识)"
+
     def _format_conversation(self, messages: list[Message]) -> str:
         lines = []
+        max_len = self.max_chars_per_message
         for msg in messages:
             role_label = {"user": "用户", "assistant": "助手", "system": "系统"}.get(msg.role, msg.role)
-            content = msg.content[:500] if len(msg.content) > 500 else msg.content
+            content = msg.content[:max_len] if len(msg.content) > max_len else msg.content
             lines.append(f"{role_label}: {content}")
         return "\n".join(lines)
 
@@ -108,3 +175,58 @@ class KnowledgeExtractor:
             merged[key] = list(existing_items | new_items)
         logger.debug(f"Merged knowledge: {sum(len(v) for v in merged.values())} total items")
         return merged
+
+    def condense_knowledge(self, knowledge: dict, max_per_category: int = 10) -> dict:
+        """当知识条目过多时，使用 LLM 精炼每个类别"""
+        category_names = {
+            "user_preferences": "用户偏好",
+            "project_decisions": "项目决策",
+            "key_facts": "关键事实",
+            "pending_tasks": "待办事项",
+            "learned_patterns": "行为模式",
+            "important_context": "重要上下文",
+        }
+
+        condensed = {}
+        for key, items in knowledge.items():
+            if len(items) <= max_per_category:
+                condensed[key] = items
+                continue
+
+            # 需要精炼
+            logger.info(f"Condensing {key}: {len(items)} -> {max_per_category}")
+            prompt_template = self.condense_prompt if self.condense_prompt and self.condense_prompt.strip() else CONDENSE_PROMPT
+            try:
+                prompt = prompt_template.format(
+                    category_name=category_names.get(key, key),
+                    count=len(items),
+                    items="\n".join(f"- {item}" for item in items),
+                    max_count=max_per_category,
+                )
+            except KeyError as e:
+                logger.warning(f"Custom condense prompt format error: {e}, falling back to default")
+                prompt = CONDENSE_PROMPT.format(
+                    category_name=category_names.get(key, key),
+                    count=len(items),
+                    items="\n".join(f"- {item}" for item in items),
+                    max_count=max_per_category,
+                )
+
+            try:
+                response = self.llm.generate(prompt)
+                # 解析 JSON 数组
+                response = response.strip()
+                if response.startswith("```"):
+                    lines = response.split("\n")
+                    response = "\n".join(lines[1:-1])
+                new_items = json.loads(response)
+                if isinstance(new_items, list):
+                    condensed[key] = new_items[:max_per_category]
+                    logger.info(f"Condensed {key}: {len(items)} -> {len(condensed[key])}")
+                else:
+                    condensed[key] = items[:max_per_category]
+            except Exception as e:
+                logger.warning(f"Failed to condense {key}: {e}")
+                condensed[key] = items[:max_per_category]
+
+        return condensed

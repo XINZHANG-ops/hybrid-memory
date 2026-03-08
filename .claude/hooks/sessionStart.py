@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from loguru import logger
-from src.memory_core import MemoryManager
+from src.memory_core import MemoryManager, publish_event
 from src.memory_core.config import load_config
 
 # 路径配置
@@ -141,6 +141,8 @@ def main():
     logger.info(f"Global DB: {GLOBAL_DB}")
     logger.info(f"Project DB: {get_project_db_path(project_name)}")
 
+    publish_event("session", f"Session started: {project_name}", session_id)
+
     output_parts = []
 
     try:
@@ -167,11 +169,35 @@ def main():
 
         # 如果当前会话没有内容，获取所有会话的摘要和最近消息
         if not project_context["summaries"] and not project_context["messages"]:
-            all_summaries = project_manager.db.get_all_summaries(limit=inject_summary_count)
+            # 获取最新 N 条（自动）
+            auto_summaries = project_manager.db.get_all_summaries(limit=inject_summary_count)
+            auto_ids = {s.id for s in auto_summaries}
+
+            # 获取额外选中的
+            selected_config = config_mgr.get("selected_summary_ids")
+            try:
+                selected_map = json.loads(selected_config) if selected_config else {}
+            except json.JSONDecodeError:
+                selected_map = {}
+            extra_ids = selected_map.get(project_name, [])
+
+            # 合并：extra + auto（去重），手动选的在上，最新的在下
+            extra_summaries = []
+            for sid in extra_ids:
+                if sid not in auto_ids:
+                    s = project_manager.db.get_summary_by_id(sid)
+                    if s:
+                        extra_summaries.append(s)
+
+            # 顺序：extra（旧的背景）在上，auto（最新的）在下
+            # auto_summaries 是 DESC 排序（最新在前），需要反转为旧到新
+            summaries = extra_summaries + list(reversed(auto_summaries))
+            logger.info(f"Injecting summaries: {len(extra_summaries)} extra + {len(auto_summaries)} auto (old to new)")
+
             recent_messages = project_manager.db.get_recent_messages_all_sessions(limit=inject_recent_count)
 
-            if all_summaries:
-                project_context["summaries"] = "\n\n---\n\n".join(s.summary_text for s in all_summaries)
+            if summaries:
+                project_context["summaries"] = "\n\n---\n\n".join(s.summary_text for s in summaries)
             if recent_messages:
                 project_context["messages"] = [{"role": m.role, "content": m.content} for m in reversed(recent_messages)]
 
@@ -187,7 +213,7 @@ def main():
                 recent = "\n".join(f"- {m['role']}: {truncate(m['content'], inject_preview_length)}" for m in project_context["messages"])
                 output_parts.append(f"# [{project_name}] 最近对话:\n{recent}")
 
-        # 2. 加载结构化知识（所有会话）
+        # 2. 加载结构化知识（所有会话，全部 6 类）
         knowledge = project_manager.get_knowledge(None)  # None = 获取所有会话的知识
         knowledge_items = []
         if knowledge.get("user_preferences"):
@@ -198,6 +224,10 @@ def main():
             knowledge_items.append(f"关键事实: {', '.join(knowledge['key_facts'][:inject_knowledge_count])}")
         if knowledge.get("pending_tasks"):
             knowledge_items.append(f"待办事项: {', '.join(knowledge['pending_tasks'][:inject_task_count])}")
+        if knowledge.get("learned_patterns"):
+            knowledge_items.append(f"行为模式: {', '.join(knowledge['learned_patterns'][:inject_knowledge_count])}")
+        if knowledge.get("important_context"):
+            knowledge_items.append(f"重要上下文: {', '.join(knowledge['important_context'][:inject_knowledge_count])}")
 
         if knowledge_items:
             output_parts.append(f"# [{project_name}] 累积知识:\n" + "\n".join(f"- {item}" for item in knowledge_items))

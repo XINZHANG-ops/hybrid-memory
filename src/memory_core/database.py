@@ -376,6 +376,36 @@ class Database:
                 return self._row_to_message(row)
             return None
 
+    def get_summary_by_id(self, summary_id: int) -> Summary | None:
+        logger.debug(f"Getting summary by id: {summary_id}")
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM summaries WHERE id = ?", (summary_id,)
+            ).fetchone()
+            if row:
+                return self._row_to_summary(row)
+            return None
+
+    def update_summary_text(self, summary_id: int, text: str):
+        logger.debug(f"Updating summary text: id={summary_id}")
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE summaries SET summary_text = ? WHERE id = ?",
+                (text, summary_id)
+            )
+        logger.info(f"Summary updated: id={summary_id}")
+
+    def get_messages_in_range(self, start_id: int, end_id: int) -> list[Message]:
+        logger.debug(f"Getting messages in range: {start_id} to {end_id}")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM messages WHERE id >= ? AND id <= ? ORDER BY id ASC",
+                (start_id, end_id)
+            ).fetchall()
+            messages = [self._row_to_message(row) for row in rows]
+            logger.debug(f"Retrieved {len(messages)} messages in range")
+            return messages
+
     def save_knowledge(self, session_id: str | None, knowledge: dict):
         logger.debug(f"Saving knowledge for session: {session_id}")
         with self._connect() as conn:
