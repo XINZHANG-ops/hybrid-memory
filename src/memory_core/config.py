@@ -17,6 +17,7 @@ DEFAULT_CONFIG = {
     "ollama_keep_alive": "10m",
     "anthropic_model": "claude-sonnet-4-20250514",
     "embedding_model": "embeddinggemma:300m",
+    "embedding_base_url": "",  # 空=使用 ollama_base_url
     "enable_vector_search": "true",
     "enable_knowledge_extraction": "true",
     "input_token_price": "0.003",
@@ -124,9 +125,16 @@ CONFIG_META = {
     "embedding_model": {
         "label": "Embedding 模型",
         "description": "用于向量搜索的 embedding 模型",
-        "tooltip": "用于将文本转换为向量的模型，用于语义搜索。需要是 Ollama 支持的 embedding 模型。推荐：nomic-embed-text, mxbai-embed-large。需要先 ollama pull 下载。",
+        "tooltip": "用于将文本转换为向量的模型，用于语义搜索。需要是 Ollama 支持的 embedding 模型。推荐：nomic-embed-text, mxbai-embed-large, embeddinggemma:300m。需要先 ollama pull 下载。更换模型后需点击「重建向量库」按钮。",
         "type": "text",
-        "group": "Search",
+        "group": "Embedding",
+    },
+    "embedding_base_url": {
+        "label": "Embedding 服务地址",
+        "description": "Embedding 服务的 HTTP 地址（默认与 Ollama 相同）",
+        "tooltip": "Embedding 服务的访问地址。通常与 Ollama 地址相同，如果使用独立的 embedding 服务可单独配置。留空则使用 Ollama 地址。",
+        "type": "text",
+        "group": "Embedding",
     },
     "enable_vector_search": {
         "label": "启用向量搜索",
@@ -134,7 +142,7 @@ CONFIG_META = {
         "tooltip": "启用后，每条消息会生成 embedding 向量并存储，支持按语义相似度搜索。需要 embedding 模型可用。会增加存储空间和消息处理时间。",
         "type": "select",
         "options": ["true", "false"],
-        "group": "Search",
+        "group": "Embedding",
     },
     "enable_knowledge_extraction": {
         "label": "启用知识提取",
@@ -339,6 +347,7 @@ class ConfigManager:
             "max_context_tokens": self.get_int("max_context_tokens"),
             "summary_trigger_threshold": self.get_int("summary_trigger_threshold"),
             "embedding_model": self.get("embedding_model"),
+            "embedding_base_url": self.get("embedding_base_url"),  # 空=使用 ollama_base_url
             "enable_vector_search": self.get("enable_vector_search").lower() == "true",
             "enable_knowledge_extraction": self.get("enable_knowledge_extraction").lower() == "true",
             # 总结配置

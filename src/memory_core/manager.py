@@ -29,6 +29,7 @@ class MemoryManager:
         max_context_tokens: int = 8000,
         summary_trigger_threshold: int = 50,
         embedding_model: str = "embeddinggemma:300m",
+        embedding_base_url: str = "",  # 空=使用 ollama_base_url
         enable_vector_search: bool = True,
         enable_knowledge_extraction: bool = True,
         # 总结配置
@@ -85,9 +86,11 @@ class MemoryManager:
         self.vector_store = None
         if enable_vector_search:
             try:
-                self.embedding_client = EmbeddingClient(model=embedding_model, base_url=ollama_base_url)
+                # 使用 embedding_base_url，如果为空则回退到 ollama_base_url
+                embed_url = embedding_base_url if embedding_base_url else ollama_base_url
+                self.embedding_client = EmbeddingClient(model=embedding_model, base_url=embed_url)
                 self.vector_store = VectorStore(self.db_path, dimension=self.embedding_client.dimension)
-                logger.info("Vector search enabled")
+                logger.info(f"Vector search enabled: model={embedding_model}, url={embed_url}")
             except Exception as e:
                 logger.warning(f"Failed to initialize vector search: {e}")
                 self.enable_vector_search = False

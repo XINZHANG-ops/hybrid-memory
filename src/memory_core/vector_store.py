@@ -97,3 +97,21 @@ class VectorStore:
             self.id_to_msg.pop(faiss_id, None)
             self.save()
             logger.debug(f"Removed message {message_id} from mapping")
+
+    def clear(self):
+        """清空向量索引（用于重建）"""
+        self.index = faiss.IndexFlatIP(self.dimension)
+        self.id_to_msg = {}
+        self.msg_to_id = {}
+        self.next_id = 0
+        self.save()
+        logger.info("Vector index cleared")
+
+    def get_stats(self) -> dict:
+        """获取向量库统计信息"""
+        return {
+            "total_vectors": self.index.ntotal if self.index else 0,
+            "mapped_messages": len(self.msg_to_id),
+            "dimension": self.dimension,
+            "index_path": str(self.index_path),
+        }

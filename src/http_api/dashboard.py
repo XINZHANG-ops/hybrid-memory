@@ -787,6 +787,85 @@ def clear_events():
     return json_response({"status": "ok"})
 
 
+@app.route("/api/projects/<project_name>/vectors/stats")
+def get_vector_stats(project_name):
+    """获取向量库统计信息"""
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+    try:
+        from src.memory_core.vector_store import VectorStore
+        from src.memory_core.config import load_config
+        config_mgr = load_config(GLOBAL_DB)
+        # 获取 embedding 维度（根据模型）
+        vector_store = VectorStore(db_path)
+        stats = vector_store.get_stats()
+        return json_response(stats)
+    except Exception as e:
+        return json_response({"error": str(e)}), 500
+
+
+@app.route("/api/projects/<project_name>/vectors/rebuild", methods=["POST"])
+def rebuild_vectors(project_name):
+    """重建向量数据库：清空后重新为所有消息生成 embedding"""
+    from src.memory_core.events import publish_event
+
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+
+    try:
+        from src.memory_core.config import load_config
+        from src.memory_core.vector_store import VectorStore
+        from src.memory_core.embedding_client import EmbeddingClient
+
+        config_mgr = load_config(GLOBAL_DB)
+        embedding_model = config_mgr.get("embedding_model")
+        embedding_base_url = config_mgr.get("embedding_base_url") or config_mgr.get("ollama_base_url")
+
+        publish_event("embedding", f"Rebuilding vectors for {project_name}", f"Model: {embedding_model}")
+
+        # 清空向量库
+        db = Database(db_path)
+        vector_store = VectorStore(db_path)
+        old_count = vector_store.get_stats()["total_vectors"]
+        vector_store.clear()
+
+        # 获取所有消息
+        with db._connect() as conn:
+            rows = conn.execute("SELECT id, content FROM messages ORDER BY id").fetchall()
+
+        if not rows:
+            return json_response({"status": "ok", "message": "No messages to index", "rebuilt": 0})
+
+        # 创建 embedding 客户端
+        embedding_client = EmbeddingClient(model=embedding_model, base_url=embedding_base_url)
+
+        # 为每条消息生成 embedding
+        rebuilt = 0
+        import numpy as np
+        for msg_id, content in rows:
+            try:
+                embedding = embedding_client.embed(content)
+                if embedding is not None:
+                    vector_store.add(msg_id, np.array(embedding))
+                    rebuilt += 1
+            except Exception as e:
+                pass  # 跳过失败的消息
+
+        publish_event("embedding", f"Rebuilt {rebuilt} vectors", f"Cleared {old_count}, new {rebuilt}")
+
+        return json_response({
+            "status": "ok",
+            "old_count": old_count,
+            "rebuilt": rebuilt,
+            "total_messages": len(rows),
+        })
+    except Exception as e:
+        publish_event("error", f"Rebuild failed: {str(e)}", project_name)
+        return json_response({"error": str(e)}), 500
+
+
 # ============ Web UI ============
 
 @app.route("/")
@@ -911,7 +990,6 @@ def index():
             <button class="tab" onclick="showPanel('search')">Search</button>
             <button class="tab" onclick="showPanel('knowledge')">Knowledge</button>
             <button class="tab" onclick="showPanel('logs')">Logs</button>
-            <button class="tab" onclick="showPanel('debug')">Debug</button>
         </div>
 
         <!-- Overview Panel -->
@@ -949,7 +1027,34 @@ def index():
                 <button onclick="regenerateAllSummaries()" style="background: #e94560;">Regenerate All</button>
                 <button onclick="saveSummarySelection()">Save Extra Selection</button>
                 <span id="selection-dirty-hint" style="color: #ffcc00; margin-left: 5px; display: none;">● Unsaved</span>
+                <span style="flex: 1;"></span>
+                <button onclick="toggleSummaryDebug()" style="background: #1f4068; padding: 6px 12px;">🔍 Debug</button>
             </div>
+
+            <!-- Summary Debug Panel (collapsible) -->
+            <div id="summary-debug-panel" style="display: none; margin-bottom: 20px;">
+                <div class="card" style="border-left: 3px solid #4a90d9;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <h3 style="margin: 0; color: #4a90d9;">Summary Debug - LLM Prompt Preview</h3>
+                        <button onclick="document.getElementById('summary-debug-panel').style.display='none'" style="background: #333; padding: 4px 10px;">Close</button>
+                    </div>
+                    <div style="margin-bottom: 10px;">
+                        <button onclick="loadSummaryDebug()" style="padding: 6px 14px;">Load Prompt</button>
+                    </div>
+                    <div id="debug-info" style="color: #888; margin-bottom: 10px;"></div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                        <div>
+                            <h4 style="color: #00d9ff; margin-bottom: 5px;">Unsummarized Messages (<span id="debug-msg-count">0</span>)</h4>
+                            <div id="debug-messages" style="max-height: 200px; overflow-y: auto;"></div>
+                        </div>
+                        <div>
+                            <h4 style="color: #e94560; margin-bottom: 5px;">Full Prompt to LLM</h4>
+                            <pre id="debug-prompt" style="background: #1a1a2e; padding: 10px; border-radius: 6px; white-space: pre-wrap; word-wrap: break-word; font-size: 0.8em; max-height: 200px; overflow-y: auto;"></pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <div style="display: flex; gap: 20px;">
                 <div style="flex: 1;">
                     <h3 style="color: #888; margin-bottom: 10px;">Available (click to add to extras)</h3>
@@ -1009,6 +1114,24 @@ def index():
                     </div>
                 </div>
             </div>
+
+            <!-- Vector Database Stats & Rebuild -->
+            <div class="card" style="margin-bottom: 15px; border-left: 3px solid #d9a04a;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                    <div>
+                        <span style="color: #d9a04a; font-weight: bold;">🔢 Vector Database</span>
+                        <span id="vector-stats" style="color: #888; margin-left: 10px; font-size: 0.9em;">Loading...</span>
+                    </div>
+                    <div style="display: flex; gap: 8px;">
+                        <button onclick="loadVectorStats()" style="padding: 6px 12px; background: #1f4068;">Refresh</button>
+                        <button onclick="rebuildVectors()" style="padding: 6px 12px; background: #e94560;">Rebuild Vectors</button>
+                    </div>
+                </div>
+                <div style="color: #666; font-size: 0.8em; margin-top: 8px;">
+                    ⚠️ 更换 Embedding 模型后需重建向量库才能正常搜索
+                </div>
+            </div>
+
             <div style="margin-bottom: 10px; color: #666; font-size: 0.85em;">
                 <span id="search-status"></span>
             </div>
@@ -1054,25 +1177,6 @@ def index():
                 </div>
             </div>
         </div>
-
-        <!-- Debug Panel -->
-        <div id="debug" class="panel">
-            <h2>Summary Debug</h2>
-            <button onclick="loadSummaryDebug()">Load Summary Prompt</button>
-            <div class="card" style="margin-top: 15px;">
-                <h3>Session Info</h3>
-                <div id="debug-info" style="color: #888;">Click "Load Summary Prompt" to view</div>
-            </div>
-            <div class="card" style="margin-top: 15px;">
-                <h3>Unsummarized Messages (<span id="debug-msg-count">0</span>)</h3>
-                <div id="debug-messages"></div>
-            </div>
-            <div class="card" style="margin-top: 15px;">
-                <h3>Full Prompt Sent to LLM</h3>
-                <pre id="debug-prompt" style="background: #1a1a2e; padding: 15px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; font-size: 0.9em;"></pre>
-            </div>
-        </div>
-
 
         <!-- Knowledge Panel -->
         <div id="knowledge" class="panel">
@@ -1165,6 +1269,14 @@ def index():
             event.target.classList.add('active');
             // Update scroll button visibility
             updateScrollButtonVisibility();
+            // Auto-load data for specific panels
+            if (id === 'knowledge' && currentProject) {
+                loadKnowledge();
+            } else if (id === 'search' && currentProject) {
+                loadVectorStats();
+            } else if (id === 'logs') {
+                loadLogs();
+            }
         }
 
         function updateScrollButtonVisibility() {
@@ -1191,12 +1303,12 @@ def index():
         function loadProjectData() {
             if (!currentProject) {
                 document.getElementById('message-list').innerHTML = '<div class="no-project">Please select a project</div>';
-                document.getElementById('summary-list').innerHTML = '<div class="no-project">Please select a project</div>';
                 document.getElementById('context-preview').innerHTML = '<div class="no-project">Please select a project</div>';
                 return;
             }
             loadSessions();
             loadMessages();
+            loadVectorStats();
             loadSummaries();
             loadContext();
         }
@@ -1867,13 +1979,17 @@ def index():
                     icon: '🧠',
                     keys: ['short_term_window_size', 'max_context_tokens', 'summary_trigger_threshold']
                 },
-                'LLM': {
+                'LLM (Ollama)': {
                     icon: '🤖',
                     keys: ['llm_provider', 'ollama_model', 'ollama_base_url', 'ollama_timeout', 'ollama_keep_alive', 'anthropic_model']
                 },
+                'Embedding': {
+                    icon: '🔢',
+                    keys: ['embedding_model', 'embedding_base_url', 'enable_vector_search']
+                },
                 'Search': {
                     icon: '🔍',
-                    keys: ['embedding_model', 'enable_vector_search', 'search_result_preview_length']
+                    keys: ['search_result_preview_length']
                 },
                 'Knowledge': {
                     icon: '📚',
@@ -1957,7 +2073,7 @@ def index():
             const configKeys = [
                 'short_term_window_size', 'max_context_tokens', 'summary_trigger_threshold',
                 'llm_provider', 'ollama_model', 'ollama_base_url', 'ollama_timeout', 'ollama_keep_alive',
-                'anthropic_model', 'embedding_model', 'enable_vector_search', 'enable_knowledge_extraction',
+                'anthropic_model', 'embedding_model', 'embedding_base_url', 'enable_vector_search', 'enable_knowledge_extraction',
                 'input_token_price', 'output_token_price',
                 'inject_summary_count', 'inject_recent_count', 'inject_preview_length', 'inject_knowledge_count', 'inject_task_count',
                 'summary_max_chars_total', 'summary_max_chars_per_message',
@@ -1988,6 +2104,16 @@ def index():
             return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         }
 
+        function toggleSummaryDebug() {
+            const panel = document.getElementById('summary-debug-panel');
+            if (panel.style.display === 'none') {
+                panel.style.display = 'block';
+                loadSummaryDebug();
+            } else {
+                panel.style.display = 'none';
+            }
+        }
+
         async function loadSummaryDebug() {
             if (!currentProject) {
                 alert('Please select a project first');
@@ -1996,22 +2122,74 @@ def index():
             const res = await fetch(`/api/projects/${currentProject}/summary-debug`);
             const data = await res.json();
             document.getElementById('debug-info').innerHTML = `
-                <div><strong>Session ID:</strong> ${data.session_id}</div>
-                <div><strong>Message Count:</strong> ${data.message_count}</div>
+                <div><strong>Session ID:</strong> ${data.session_id} | <strong>Messages:</strong> ${data.message_count} | <strong>Custom Template:</strong> ${data.using_custom_template ? 'Yes' : 'No'}</div>
             `;
             document.getElementById('debug-msg-count').textContent = data.message_count;
             document.getElementById('debug-messages').innerHTML = data.messages.map(m => `
-                <div class="message ${m.role}" style="margin: 5px 0; padding: 8px; border-radius: 4px; background: ${m.role === 'user' ? '#1a3a4a' : '#2a1a4a'};">
-                    <div style="color: ${m.role === 'user' ? '#00d9ff' : '#ff6b9d'}; font-weight: bold;">${m.role} (id: ${m.id})</div>
-                    <div style="font-size: 0.9em; color: #ccc;">${escapeHtml(m.content)}</div>
+                <div style="margin: 3px 0; padding: 6px; border-radius: 4px; background: ${m.role === 'user' ? '#1a3a4a' : '#2a1a4a'}; font-size: 0.85em;">
+                    <span style="color: ${m.role === 'user' ? '#00d9ff' : '#ff6b9d'}; font-weight: bold;">${m.role}</span>
+                    <span style="color: #888; margin-left: 5px;">(#${m.id})</span>
+                    <div style="color: #ccc; margin-top: 3px;">${escapeHtml(m.content.substring(0, 150))}${m.content.length > 150 ? '...' : ''}</div>
                 </div>
             `).join('') || '<p style="color: #888;">No unsummarized messages</p>';
             document.getElementById('debug-prompt').textContent = data.full_prompt || 'No prompt generated';
         }
 
+        async function loadVectorStats() {
+            if (!currentProject) {
+                document.getElementById('vector-stats').textContent = 'Select a project first';
+                return;
+            }
+            try {
+                const res = await fetch(`/api/projects/${currentProject}/vectors/stats`);
+                const data = await res.json();
+                if (data.error) {
+                    document.getElementById('vector-stats').innerHTML = `<span style="color: #e94560;">Error: ${data.error}</span>`;
+                } else {
+                    document.getElementById('vector-stats').innerHTML = `Vectors: <strong>${data.total_vectors}</strong> | Mapped: <strong>${data.mapped_messages}</strong> | Dim: ${data.dimension}`;
+                }
+            } catch (e) {
+                document.getElementById('vector-stats').innerHTML = `<span style="color: #e94560;">Failed to load</span>`;
+            }
+        }
+
+        async function rebuildVectors() {
+            if (!currentProject) {
+                alert('Please select a project first');
+                return;
+            }
+            if (!confirm('This will clear and rebuild all vector embeddings.\\nThis may take a while for large projects.\\n\\nContinue?')) {
+                return;
+            }
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Rebuilding...';
+            document.getElementById('vector-stats').innerHTML = '<span style="color: #d9a04a;">Rebuilding...</span>';
+
+            try {
+                const res = await fetch(`/api/projects/${currentProject}/vectors/rebuild`, {method: 'POST'});
+                const data = await res.json();
+                btn.disabled = false;
+                btn.textContent = 'Rebuild Vectors';
+
+                if (data.error) {
+                    alert('Error: ' + data.error);
+                    loadVectorStats();
+                } else {
+                    document.getElementById('vector-stats').innerHTML = `<span style="color: #4ad9a0;">✓ Rebuilt ${data.rebuilt}/${data.total_messages} vectors</span>`;
+                    setTimeout(loadVectorStats, 2000);
+                }
+            } catch (e) {
+                btn.disabled = false;
+                btn.textContent = 'Rebuild Vectors';
+                alert('Failed to rebuild: ' + e.message);
+                loadVectorStats();
+            }
+        }
+
         async function refreshAll() {
-            // Debug/Vector/Knowledge 页面不自动刷新
-            if (currentPanel === 'debug' || currentPanel === 'vector' || currentPanel === 'knowledge') {
+            // 某些页面不自动刷新
+            if (currentPanel === 'knowledge' || currentPanel === 'search') {
                 return;
             }
             // 编辑中不刷新，避免打断用户操作
