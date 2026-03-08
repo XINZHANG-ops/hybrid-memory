@@ -53,7 +53,7 @@ CONFIG_META = {
     "short_term_window_size": {
         "label": "短期记忆消息数",
         "description": "保留最近多少条消息作为短期记忆",
-        "tooltip": "短期记忆是最近的对话消息，用于 get_context() 返回给 Claude。这个数值决定了在没有 token 限制时最多返回多少条最近消息。实际返回数量还受 max_context_tokens 限制。影响模块：ShortTermMemory",
+        "tooltip": "【MCP get_context() 专用】当 Claude 主动调用 MCP 工具查询上下文时，返回当前 session 内最近 N 条消息。这是实时查询，可在对话中随时调用。与「注入近期对话数」的区别：本配置用于 MCP 工具返回值，限定单个 session；注入配置用于会话启动时的自动注入，跨所有 session。实际返回数量还受 max_context_tokens 限制。影响模块：ShortTermMemory",
         "type": "number",
         "min": 5,
         "max": 100,
@@ -183,7 +183,7 @@ CONFIG_META = {
     "inject_recent_count": {
         "label": "注入近期对话数",
         "description": "启动时注入的近期原始消息数量",
-        "tooltip": "新会话开始时，注入最近 N 条原始对话消息（user/assistant）。这些是未经总结的原始消息，用于保持短期对话连续性。与摘要不同，这里是完整的消息内容（可能被 inject_preview_length 截断）。影响模块：sessionStart hook",
+        "tooltip": "【sessionStart hook 专用】新会话启动时，自动注入跨所有 session 的最近 N 条原始消息到 system-reminder。这是启动时的一次性快照，让 Claude 快速了解最近聊了什么。与「短期记忆消息数」的区别：本配置用于会话启动时自动注入，跨所有 session；短期记忆用于 MCP 工具实时查询，限定单个 session。消息可能被 inject_preview_length 截断。影响模块：sessionStart hook",
         "type": "number",
         "min": 3,
         "max": 20,

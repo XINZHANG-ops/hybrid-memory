@@ -4,12 +4,37 @@ Hybrid Memory Dashboard - Web UI
 """
 import os
 import sys
+import time
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from flask import Flask, jsonify, request, Response
 import json
+from loguru import logger
+
+# 配置 loguru 写入统一日志文件
+MEMORY_BASE = Path(__file__).parent.parent.parent / "data"
+LOG_FILE = MEMORY_BASE / "app.log"
+MEMORY_BASE.mkdir(parents=True, exist_ok=True)
+
+# 移除默认 handler，添加文件输出
+logger.remove()
+logger.add(
+    LOG_FILE,
+    rotation="10 MB",
+    retention="7 days",
+    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
+    level="DEBUG",
+    encoding="utf-8",
+)
+# 同时输出到 stderr（终端）
+logger.add(
+    sys.stderr,
+    format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | <level>{message}</level>",
+    level="INFO",
+)
 from src.memory_core import (
     MemoryManager, ConfigManager, DEFAULT_CONFIG, CONFIG_META,
     EXTRACTION_PROMPT, CONDENSE_PROMPT, SUMMARY_PROMPT, SUMMARY_PROMPT_WITH_CONTEXT
@@ -19,7 +44,7 @@ from src.memory_core.database import Database
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False  # 支持中文
 
-MEMORY_BASE = Path(__file__).parent.parent.parent / "data"
+# MEMORY_BASE 和 LOG_FILE 已在顶部定义
 GLOBAL_DB = MEMORY_BASE / "global_memory.db"
 PROJECTS_DIR = MEMORY_BASE / "projects"
 
@@ -677,7 +702,8 @@ def get_summary_debug(project_name):
     with db._connect() as conn:
         row = conn.execute("SELECT session_id FROM sessions ORDER BY last_active_at DESC LIMIT 1").fetchone()
     session_id = row[0] if row else f"{project_name}-session"
-    messages = db.get_unsummarized_messages(session_id)
+    # 获取所有未总结消息（跨 session），而不只是当前 session
+    messages = db.get_unsummarized_messages(session_id=None)
     summaries = db.get_summaries(session_id)
     previous_context = "\n\n---\n\n".join(s.summary_text for s in summaries) if summaries else ""
 
@@ -708,13 +734,23 @@ def get_summary_debug(project_name):
         else:
             prompt = SUMMARY_PROMPT.format(conversation=conversation)
 
+    # 获取最新消息 ID 和最后一个 summary 的范围
+    with db._connect() as conn:
+        latest_msg = conn.execute("SELECT MAX(id) FROM messages").fetchone()
+        latest_msg_id = latest_msg[0] if latest_msg and latest_msg[0] else 0
+        last_summary = conn.execute("SELECT message_range_end FROM summaries ORDER BY id DESC LIMIT 1").fetchone()
+        last_summary_end_id = last_summary[0] if last_summary and last_summary[0] else 0
+
     return json_response({
         "session_id": session_id,
         "message_count": len(messages),
         "summary_count": len(summaries),
+        "latest_message_id": latest_msg_id,
+        "last_summary_end_id": last_summary_end_id,
+        "pending_count": latest_msg_id - last_summary_end_id if latest_msg_id > last_summary_end_id else 0,
         "using_custom_template": using_custom,
         "previous_context": previous_context[:1000] + "..." if len(previous_context) > 1000 else previous_context,
-        "messages": [{"id": m.id, "role": m.role, "content": m.content[:max_chars_per_message] if len(m.content) > max_chars_per_message else m.content, "is_summarized": m.is_summarized} for m in messages],
+        "messages": [{"id": m.id, "role": m.role, "content": m.content[:max_chars_per_message] if len(m.content) > max_chars_per_message else m.content, "is_summarized": m.is_summarized, "session_id": m.session_id} for m in messages],
         "formatted_conversation": conversation,
         "full_prompt": prompt,
     })
@@ -722,13 +758,85 @@ def get_summary_debug(project_name):
 
 @app.route("/api/logs")
 def get_logs():
-    log_file = MEMORY_BASE / "hooks.log"
-    if not log_file.exists():
-        return json_response({"logs": []})
-    lines = int(request.args.get("lines", 100))
-    with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-        all_lines = f.readlines()
-    return json_response({"logs": all_lines[-lines:]})
+    """获取合并的日志（app.log + hooks.log）"""
+    lines = int(request.args.get("lines", 200))
+    source = request.args.get("source", "all")  # all, app, hooks
+
+    all_logs = []
+
+    # 读取 app.log
+    if source in ("all", "app") and LOG_FILE.exists():
+        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                all_logs.append({"source": "app", "line": line.rstrip()})
+
+    # 读取 hooks.log
+    hooks_log = MEMORY_BASE / "hooks.log"
+    if source in ("all", "hooks") and hooks_log.exists():
+        with open(hooks_log, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                all_logs.append({"source": "hooks", "line": line.rstrip()})
+
+    # 按时间戳排序（假设日志格式以时间开头）
+    # 简单策略：保持原顺序，取最后 N 行
+    return json_response({"logs": all_logs[-lines:]})
+
+
+@app.route("/api/logs/stream")
+def stream_logs():
+    """SSE 实时日志流"""
+    def generate():
+        last_pos_app = 0
+        last_pos_hooks = 0
+        hooks_log = MEMORY_BASE / "hooks.log"
+
+        # 初始化位置到文件末尾
+        if LOG_FILE.exists():
+            last_pos_app = LOG_FILE.stat().st_size
+        if hooks_log.exists():
+            last_pos_hooks = hooks_log.stat().st_size
+
+        yield f"data: {json.dumps({'type': 'connected', 'message': 'Log stream connected'})}\n\n"
+
+        while True:
+            new_lines = []
+
+            # 检查 app.log 新内容
+            if LOG_FILE.exists():
+                current_size = LOG_FILE.stat().st_size
+                if current_size > last_pos_app:
+                    with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                        f.seek(last_pos_app)
+                        for line in f:
+                            new_lines.append({"source": "app", "line": line.rstrip()})
+                    last_pos_app = current_size
+                elif current_size < last_pos_app:
+                    # 文件被截断（rotation）
+                    last_pos_app = 0
+
+            # 检查 hooks.log 新内容
+            if hooks_log.exists():
+                current_size = hooks_log.stat().st_size
+                if current_size > last_pos_hooks:
+                    with open(hooks_log, "r", encoding="utf-8", errors="replace") as f:
+                        f.seek(last_pos_hooks)
+                        for line in f:
+                            new_lines.append({"source": "hooks", "line": line.rstrip()})
+                    last_pos_hooks = current_size
+                elif current_size < last_pos_hooks:
+                    last_pos_hooks = 0
+
+            if new_lines:
+                for log in new_lines:
+                    yield f"data: {json.dumps({'type': 'log', 'data': log}, ensure_ascii=False)}\n\n"
+
+            time.sleep(0.5)  # 轮询间隔
+
+    return Response(generate(), mimetype='text/event-stream', headers={
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+    })
 
 
 @app.route("/api/config")
@@ -917,10 +1025,28 @@ def index():
         .stat { text-align: center; }
         .stat-value { font-size: 2em; color: #00d9ff; }
         .stat-label { color: #888; }
-        .log-line { font-family: monospace; font-size: 0.75em; padding: 2px 0; border-bottom: 1px solid #333; white-space: pre-wrap; word-break: break-all; }
-        .log-line.error { color: #e94560; }
-        .log-line.info { color: #00d9ff; }
-        .log-line.debug { color: #666; }
+        /* Terminal-style log container */
+        .terminal-log {
+            background: #0a0a0a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 10px;
+            height: 500px;
+            overflow-y: auto;
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+            font-size: 0.8em;
+            line-height: 1.4;
+        }
+        .log-line { padding: 1px 5px; white-space: pre-wrap; word-break: break-all; border-radius: 2px; margin: 1px 0; }
+        .log-line:hover { background: #1a1a1a; }
+        .log-line.error { color: #ff6b6b; background: rgba(255,107,107,0.1); }
+        .log-line.warning { color: #ffa726; }
+        .log-line.info { color: #4fc3f7; }
+        .log-line.debug { color: #888; }
+        .log-line .log-time { color: #666; }
+        .log-line .log-level { font-weight: bold; }
+        .log-line .log-source { color: #9c27b0; font-size: 0.85em; }
+        .log-line.hidden { display: none; }
         .search-box { display: flex; gap: 10px; margin-bottom: 15px; }
         .search-box input { flex: 1; }
         .context-preview { background: #0f3460; padding: 15px; border-radius: 8px; margin: 10px 0; }
@@ -1140,9 +1266,33 @@ def index():
 
         <!-- Logs Panel -->
         <div id="logs" class="panel">
-            <h2>Hook Logs</h2>
-            <button onclick="loadLogs()">Refresh</button>
-            <div id="log-list" style="margin-top: 15px;"></div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                <h2 style="margin: 0;">System Logs</h2>
+                <div style="display: flex; gap: 10px; align-items: center;">
+                    <select id="log-source" onchange="loadLogs()" style="padding: 5px;">
+                        <option value="all">All Sources</option>
+                        <option value="app">App Only</option>
+                        <option value="hooks">Hooks Only</option>
+                    </select>
+                    <select id="log-level" onchange="filterLogLevel()" style="padding: 5px;">
+                        <option value="all">All Levels</option>
+                        <option value="error">ERROR</option>
+                        <option value="warning">WARNING</option>
+                        <option value="info">INFO</option>
+                        <option value="debug">DEBUG</option>
+                    </select>
+                    <label style="color: #888; font-size: 0.85em; display: flex; align-items: center; gap: 5px;">
+                        <input type="checkbox" id="log-autoscroll" checked> Auto-scroll
+                    </label>
+                    <label style="color: #888; font-size: 0.85em; display: flex; align-items: center; gap: 5px;">
+                        <input type="checkbox" id="log-realtime" onchange="toggleRealtimeLogs()"> Realtime
+                    </label>
+                    <button onclick="loadLogs()" style="padding: 5px 15px;">Refresh</button>
+                    <button onclick="clearLogDisplay()" style="padding: 5px 15px; background: #333;">Clear</button>
+                </div>
+            </div>
+            <div id="log-status" style="font-size: 0.8em; color: #888; margin-bottom: 5px;"></div>
+            <div id="log-list" class="terminal-log"></div>
         </div>
 
         <!-- Config Modal -->
@@ -1181,17 +1331,18 @@ def index():
         <!-- Knowledge Panel -->
         <div id="knowledge" class="panel">
             <h2>Structured Knowledge</h2>
-            <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px;">
-                <button onclick="loadKnowledge()">Refresh</button>
-                <button onclick="extractKnowledge()" style="background: #4a90d9;">Extract Now</button>
-                <button id="condense-btn" onclick="condenseKnowledge()" style="background: #e94560; display: none;">Condense</button>
-                <button onclick="loadKnowledgeDebug()" style="background: #1f4068;">View Prompt</button>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px; align-items: center;">
+                <button onclick="loadKnowledge()" title="Reload current knowledge from database">Refresh</button>
+                <button onclick="extractKnowledge()" style="background: #4a90d9;" title="Extract NEW knowledge from unsummarized messages (incremental)">Extract New</button>
+                <button id="condense-btn" onclick="condenseKnowledge()" style="background: #e94560;" title="Condense/refine existing knowledge (merge duplicates, remove outdated)">Condense</button>
+                <button onclick="loadKnowledgeDebug()" style="background: #6c5ce7; color: #fff;" title="View the prompt that will be sent to LLM">View Prompt</button>
+                <span id="knowledge-status" style="color: #888; font-size: 0.85em; margin-left: 10px;"></span>
             </div>
             <div id="knowledge-debug-panel" style="display: none; margin-bottom: 15px;">
                 <div class="card">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                         <h3 style="margin: 0;">Knowledge Extraction Prompt</h3>
-                        <button onclick="document.getElementById('knowledge-debug-panel').style.display='none'" style="background: #333; padding: 4px 10px;">Close</button>
+                        <button onclick="document.getElementById('knowledge-debug-panel').style.display='none'" style="background: #e94560; color: #fff; padding: 4px 12px;">Close</button>
                     </div>
                     <div id="knowledge-debug-info" style="color: #888; margin-bottom: 10px;"></div>
                     <div style="margin-bottom: 10px;">
@@ -1447,7 +1598,7 @@ def index():
             const parts = parseAssistantContent(m.content);
             let html = `<div style="display: flex; justify-content: flex-start; margin-bottom: 20px;">
                 <div style="max-width: 85%; width: 100%;">
-                    <div style="font-size: 0.75em; color: #e94560; margin-bottom: 8px; font-weight: bold;">Assistant</div>`;
+                    <div style="font-size: 0.75em; color: #e94560; margin-bottom: 8px; font-weight: bold;">Assistant <span style="color: #666; font-weight: normal;">#${m.id}</span></div>`;
 
             for (const part of parts) {
                 if (part.type === 'thinking') {
@@ -1488,7 +1639,7 @@ def index():
                     return `
                     <div style="display: flex; justify-content: flex-end; margin-bottom: 20px;">
                         <div style="max-width: 80%; background: #1a3a5c; border-radius: 12px; padding: 12px 16px; border-left: 3px solid #00d9ff;">
-                            <div style="font-size: 0.75em; color: #00d9ff; margin-bottom: 6px; font-weight: bold;">You</div>
+                            <div style="font-size: 0.75em; color: #00d9ff; margin-bottom: 6px; font-weight: bold;">You <span style="color: #666; font-weight: normal;">#${m.id}</span></div>
                             <div style="white-space: pre-wrap; word-break: break-word; line-height: 1.5; color: #eee;">${escapeHtml(m.content)}</div>
                             <div style="font-size: 0.7em; color: #666; margin-top: 8px; text-align: right;">${m.timestamp} ${m.is_summarized ? '✓ Summarized' : ''}</div>
                         </div>
@@ -1681,7 +1832,7 @@ def index():
 
                 return `<div style="display: flex; justify-content: ${isUser ? 'flex-end' : 'flex-start'}; margin-bottom: 10px; ${excludedStyle}">
                     <div style="max-width: 90%; background: ${bgColor}; border-radius: 8px; padding: 10px; border-left: 3px solid ${borderColor};">
-                        <div style="font-size: 0.7em; color: ${borderColor}; font-weight: bold;">${isUser ? 'You' : 'Assistant'}${excludedBadge}${truncatedBadge}</div>
+                        <div style="font-size: 0.7em; color: ${borderColor}; font-weight: bold;">${isUser ? 'You' : 'Assistant'} <span style="color: #666; font-weight: normal;">#${m.id}</span>${excludedBadge}${truncatedBadge}</div>
                         <div style="white-space: pre-wrap; word-break: break-word; font-size: 0.85em; color: #eee;">${escapeHtml(displayContent)}${isTruncated && !isExcluded ? '<span style="color: #888;">...</span>' : ''}</div>
                     </div>
                 </div>`;
@@ -1940,18 +2091,125 @@ def index():
             doUnifiedSearch();
         }
 
+        let logEventSource = null;
+        let logLineCount = 0;
+        const MAX_LOG_LINES = 1000;
+
+        function formatLogLine(log) {
+            const line = log.line || log;
+            const source = log.source || 'app';
+            let cls = 'log-line';
+            let levelMatch = line.match(/\\| (ERROR|WARNING|INFO|DEBUG|CRITICAL)\\s*\\|/i);
+            if (levelMatch) {
+                cls += ' ' + levelMatch[1].toLowerCase();
+            } else if (line.includes('ERROR') || line.includes('error')) {
+                cls += ' error';
+            } else if (line.includes('WARNING') || line.includes('warning')) {
+                cls += ' warning';
+            } else if (line.includes('INFO')) {
+                cls += ' info';
+            } else if (line.includes('DEBUG')) {
+                cls += ' debug';
+            }
+
+            const sourceTag = `<span class="log-source">[${source}]</span> `;
+            return `<div class="${cls}" data-level="${cls.split(' ')[1] || 'other'}" data-source="${source}">${sourceTag}${escapeHtml(line)}</div>`;
+        }
+
         async function loadLogs() {
-            const res = await fetch('/api/logs?lines=200');
+            const source = document.getElementById('log-source').value;
+            const res = await fetch(`/api/logs?lines=300&source=${source}`);
             const data = await res.json();
             const el = document.getElementById('log-list');
-            el.innerHTML = data.logs.map(line => {
-                let cls = 'log-line';
-                if (line.includes('ERROR')) cls += ' error';
-                else if (line.includes('INFO')) cls += ' info';
-                else if (line.includes('DEBUG')) cls += ' debug';
-                return `<div class="${cls}">${escapeHtml(line)}</div>`;
-            }).join('');
-            el.scrollTop = el.scrollHeight;
+            el.innerHTML = data.logs.map(log => formatLogLine(log)).join('');
+            logLineCount = data.logs.length;
+            filterLogLevel();
+            if (document.getElementById('log-autoscroll').checked) {
+                el.scrollTop = el.scrollHeight;
+            }
+            updateLogStatus(`Loaded ${data.logs.length} lines`);
+        }
+
+        function appendLogLine(log) {
+            const el = document.getElementById('log-list');
+            el.insertAdjacentHTML('beforeend', formatLogLine(log));
+            logLineCount++;
+
+            // 限制最大行数
+            if (logLineCount > MAX_LOG_LINES) {
+                const firstChild = el.firstElementChild;
+                if (firstChild) {
+                    firstChild.remove();
+                    logLineCount--;
+                }
+            }
+
+            filterLogLevel();
+            if (document.getElementById('log-autoscroll').checked) {
+                el.scrollTop = el.scrollHeight;
+            }
+        }
+
+        function filterLogLevel() {
+            const level = document.getElementById('log-level').value;
+            const lines = document.querySelectorAll('#log-list .log-line');
+            lines.forEach(line => {
+                if (level === 'all') {
+                    line.classList.remove('hidden');
+                } else {
+                    const lineLevel = line.dataset.level;
+                    line.classList.toggle('hidden', lineLevel !== level && lineLevel !== 'other');
+                }
+            });
+        }
+
+        function clearLogDisplay() {
+            document.getElementById('log-list').innerHTML = '';
+            logLineCount = 0;
+            updateLogStatus('Cleared');
+        }
+
+        function updateLogStatus(msg) {
+            const el = document.getElementById('log-status');
+            el.textContent = `${new Date().toLocaleTimeString()} - ${msg}`;
+        }
+
+        function toggleRealtimeLogs() {
+            const enabled = document.getElementById('log-realtime').checked;
+            if (enabled) {
+                startRealtimeLogs();
+            } else {
+                stopRealtimeLogs();
+            }
+        }
+
+        function startRealtimeLogs() {
+            if (logEventSource) {
+                logEventSource.close();
+            }
+            updateLogStatus('Connecting to realtime stream...');
+            logEventSource = new EventSource('/api/logs/stream');
+
+            logEventSource.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.type === 'connected') {
+                    updateLogStatus('Realtime: Connected');
+                } else if (data.type === 'log') {
+                    appendLogLine(data.data);
+                }
+            };
+
+            logEventSource.onerror = () => {
+                updateLogStatus('Realtime: Disconnected (retrying...)');
+            };
+        }
+
+        function stopRealtimeLogs() {
+            if (logEventSource) {
+                logEventSource.close();
+                logEventSource = null;
+                updateLogStatus('Realtime: Stopped');
+            }
         }
 
         let configMeta = {};
@@ -2121,17 +2379,27 @@ def index():
             }
             const res = await fetch(`/api/projects/${currentProject}/summary-debug`);
             const data = await res.json();
+
+            // 显示更详细的状态信息
+            const statusColor = data.pending_count > 0 ? '#ffcc00' : '#4caf50';
             document.getElementById('debug-info').innerHTML = `
-                <div><strong>Session ID:</strong> ${data.session_id} | <strong>Messages:</strong> ${data.message_count} | <strong>Custom Template:</strong> ${data.using_custom_template ? 'Yes' : 'No'}</div>
+                <div style="display: flex; flex-wrap: wrap; gap: 15px; align-items: center;">
+                    <div><strong>Latest Msg:</strong> <span style="color: #00d9ff;">#${data.latest_message_id}</span></div>
+                    <div><strong>Last Summary:</strong> <span style="color: #4caf50;">→ #${data.last_summary_end_id}</span></div>
+                    <div><strong>Pending:</strong> <span style="color: ${statusColor}; font-weight: bold;">${data.pending_count} messages</span></div>
+                    <div><strong>Unsummarized:</strong> ${data.message_count}</div>
+                    <div><strong>Custom Template:</strong> ${data.using_custom_template ? 'Yes' : 'No'}</div>
+                </div>
             `;
             document.getElementById('debug-msg-count').textContent = data.message_count;
             document.getElementById('debug-messages').innerHTML = data.messages.map(m => `
                 <div style="margin: 3px 0; padding: 6px; border-radius: 4px; background: ${m.role === 'user' ? '#1a3a4a' : '#2a1a4a'}; font-size: 0.85em;">
                     <span style="color: ${m.role === 'user' ? '#00d9ff' : '#ff6b9d'}; font-weight: bold;">${m.role}</span>
-                    <span style="color: #888; margin-left: 5px;">(#${m.id})</span>
+                    <span style="color: #888; margin-left: 5px;">#${m.id}</span>
+                    <span style="color: #666; margin-left: 5px; font-size: 0.8em;">[${m.session_id ? m.session_id.substring(0, 8) : 'unknown'}...]</span>
                     <div style="color: #ccc; margin-top: 3px;">${escapeHtml(m.content.substring(0, 150))}${m.content.length > 150 ? '...' : ''}</div>
                 </div>
-            `).join('') || '<p style="color: #888;">No unsummarized messages</p>';
+            `).join('') || '<p style="color: #888;">No unsummarized messages (all caught up!)</p>';
             document.getElementById('debug-prompt').textContent = data.full_prompt || 'No prompt generated';
         }
 
@@ -2203,11 +2471,13 @@ def index():
 
         async function loadKnowledge() {
             if (!currentProject) {
-                alert('Please select a project first');
+                document.getElementById('knowledge-status').textContent = 'Select a project first';
                 return;
             }
+            document.getElementById('knowledge-status').textContent = 'Loading...';
             const res = await fetch(`/api/projects/${currentProject}/knowledge`);
             let data = await res.json();
+            document.getElementById('knowledge-status').textContent = '';
 
             // 自动精炼：如果启用且需要精炼
             if (data.auto_condense && data.needs_condense) {
@@ -2237,10 +2507,19 @@ def index():
                     : '<li style="color: #666;">No items</li>';
             }
 
-            // 更新手动精炼按钮状态
+            // 更新精炼按钮状态（始终显示，但根据需要调整样式）
             const condenseBtn = document.getElementById('condense-btn');
             if (condenseBtn) {
-                condenseBtn.style.display = data.needs_condense ? 'inline-block' : 'none';
+                const totalItems = Object.values(k).flat().length;
+                if (data.needs_condense) {
+                    condenseBtn.style.background = '#e94560';
+                    condenseBtn.style.opacity = '1';
+                    condenseBtn.title = `Condense needed! Some categories exceed ${maxPerCategory} items limit`;
+                } else {
+                    condenseBtn.style.background = '#666';
+                    condenseBtn.style.opacity = '0.7';
+                    condenseBtn.title = `Condense/refine ${totalItems} items (no categories over limit)`;
+                }
             }
         }
 
@@ -2263,14 +2542,19 @@ def index():
             const btn = event.target;
             btn.disabled = true;
             btn.textContent = 'Extracting...';
+            document.getElementById('knowledge-status').textContent = 'Sending to LLM...';
             const res = await fetch(`/api/projects/${currentProject}/knowledge/extract`, {method: 'POST'});
             const data = await res.json();
             btn.disabled = false;
-            btn.textContent = 'Extract Now';
+            btn.textContent = 'Extract New';
+            document.getElementById('knowledge-status').textContent = '';
             if (data.error) {
                 alert('Error: ' + data.error);
                 return;
             }
+            const newItems = Object.values(data.extracted || {}).flat().length;
+            document.getElementById('knowledge-status').textContent = `Extracted ${newItems} new items`;
+            setTimeout(() => { document.getElementById('knowledge-status').textContent = ''; }, 3000);
             loadKnowledge();
         }
 

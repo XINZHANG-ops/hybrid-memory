@@ -125,7 +125,10 @@ class MemoryManager:
         # 实时生成 embedding 并索引
         if self.enable_vector_search and self.embedding_client and self.vector_store:
             try:
-                publish_event("embedding", f"Generating embedding for message #{message.id}", "")
+                # 根据数据库路径确定来源标识
+                db_name = self.db_path.stem  # 如 "hybrid-memory" 或 "global_memory"
+                source_tag = "[Global]" if "global" in db_name.lower() else f"[{db_name}]"
+                publish_event("embedding", f"{source_tag} Embedding #{message.id}", "")
                 embedding = self.embedding_client.embed(content)
                 self.vector_store.add(message.id, embedding)
                 logger.debug(f"Message {message.id} indexed in vector store")
@@ -167,10 +170,14 @@ class MemoryManager:
             return None
         logger.info(f"Summarizing {len(messages)} messages across all sessions")
 
+        # 根据数据库路径确定来源标识
+        db_name = self.db_path.stem
+        source_tag = "[Global]" if "global" in db_name.lower() else f"[{db_name}]"
+
         # 在总结前提取知识（使用相同的消息，并传入已有知识避免重复）
         if self.enable_knowledge_extraction and self.knowledge_extractor:
             try:
-                publish_event("knowledge", f"Extracting knowledge from {len(messages)} messages", "Sending to LLM...")
+                publish_event("knowledge", f"{source_tag} Extracting knowledge from {len(messages)} msgs", "Sending to LLM...")
                 existing_knowledge = self.db.get_knowledge()
                 new_knowledge = self.knowledge_extractor.extract(messages, existing_knowledge)
                 if new_knowledge:
@@ -180,15 +187,15 @@ class MemoryManager:
                     new_items = sum(len(v) for v in new_knowledge.values())
                     total_items = sum(len(v) for v in merged.values())
                     logger.info(f"Extracted {new_items} new items, total {total_items} knowledge items")
-                    publish_event("knowledge_done", f"Extracted {new_items} new items (total: {total_items})", "")
+                    publish_event("knowledge_done", f"{source_tag} +{new_items} items (total: {total_items})", "")
             except Exception as e:
                 logger.warning(f"Knowledge extraction during summary failed: {e}")
-                publish_event("error", f"Knowledge extraction failed: {e}", "")
+                publish_event("error", f"{source_tag} Knowledge extraction failed: {e}", "")
 
-        publish_event("summary", f"Generating summary for {len(messages)} messages", "Sending to LLM...")
+        publish_event("summary", f"{source_tag} Summarizing {len(messages)} messages", "Sending to LLM...")
         summary = self.long_term.create_summary(session_id, messages)
         if summary:
-            publish_event("summary_done", f"Summary created: #{summary.id}", f"{len(summary.summary_text)} chars")
+            publish_event("summary_done", f"{source_tag} Summary #{summary.id} ({len(summary.summary_text)} chars)", "")
         return summary
 
     def end_session(self, session_id: str) -> Summary | None:
