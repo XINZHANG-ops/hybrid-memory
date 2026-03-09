@@ -69,6 +69,14 @@ def get_project_list():
 def list_projects():
     projects = get_project_list()
     result = []
+
+    global_db = Database(GLOBAL_DB) if GLOBAL_DB.exists() else None
+    input_price = float(global_db.get_config("input_token_price", "0.003")) if global_db else 0.003
+    output_price = float(global_db.get_config("output_token_price", "0.015")) if global_db else 0.015
+
+    total_input_tokens = 0
+    total_output_tokens = 0
+
     for p in projects:
         db_path = PROJECTS_DIR / f"{p}.db"
         try:
@@ -77,15 +85,49 @@ def list_projects():
                 msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
                 session_count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
                 summary_count = conn.execute("SELECT COUNT(*) FROM summaries").fetchone()[0]
+                try:
+                    token_row = conn.execute(
+                        "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) FROM token_usage"
+                    ).fetchone()
+                    input_tokens = token_row[0]
+                    output_tokens = token_row[1]
+                except Exception:
+                    input_tokens = 0
+                    output_tokens = 0
+
+            total_input_tokens += input_tokens
+            total_output_tokens += output_tokens
+            input_cost = (input_tokens / 1000) * input_price
+            output_cost = (output_tokens / 1000) * output_price
+
             result.append({
                 "name": p,
                 "messages": msg_count,
                 "sessions": session_count,
                 "summaries": summary_count,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost": round(input_cost + output_cost, 4),
             })
         except Exception as e:
             result.append({"name": p, "error": str(e)})
-    return json_response({"projects": result})
+
+    total_input_cost = (total_input_tokens / 1000) * input_price
+    total_output_cost = (total_output_tokens / 1000) * output_price
+
+    return json_response({
+        "projects": result,
+        "global_db": str(GLOBAL_DB),
+        "totals": {
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "input_cost": round(total_input_cost, 4),
+            "output_cost": round(total_output_cost, 4),
+            "total_cost": round(total_input_cost + total_output_cost, 4),
+            "input_price_per_1k": input_price,
+            "output_price_per_1k": output_price,
+        }
+    })
 
 
 @app.route("/api/projects/<project_name>/sessions")
@@ -114,16 +156,16 @@ def get_messages(project_name):
     with db._connect() as conn:
         if session_id:
             rows = conn.execute(
-                "SELECT id, session_id, role, content, timestamp, is_summarized FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                "SELECT id, session_id, role, content, timestamp, is_summarized, COALESCE(model, '') as model FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
                 (session_id, limit),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT id, session_id, role, content, timestamp, is_summarized FROM messages ORDER BY id DESC LIMIT ?",
+                "SELECT id, session_id, role, content, timestamp, is_summarized, COALESCE(model, '') as model FROM messages ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
     return json_response({
-        "messages": [{"id": r[0], "session_id": r[1], "role": r[2], "content": r[3], "timestamp": str(r[4]), "is_summarized": bool(r[5])} for r in rows]
+        "messages": [{"id": r[0], "session_id": r[1], "role": r[2], "content": r[3], "timestamp": str(r[4]), "is_summarized": bool(r[5]), "model": r[6]} for r in rows]
     })
 
 
@@ -137,7 +179,7 @@ def get_messages_range(project_name):
     db = Database(db_path)
     messages = db.get_messages_in_range(start, end)
     return json_response({
-        "messages": [{"id": m.id, "role": m.role, "content": m.content, "timestamp": str(m.timestamp)} for m in messages]
+        "messages": [{"id": m.id, "role": m.role, "content": m.content, "timestamp": str(m.timestamp), "model": m.model} for m in messages]
     })
 
 
@@ -401,21 +443,21 @@ def unified_search():
                     proj_results.append({
                         "id": msg.id, "project": proj_name, "role": msg.role,
                         "content": msg.content, "score": round(score, 4),
-                        "timestamp": str(msg.timestamp), "method": "vector"
+                        "timestamp": str(msg.timestamp), "method": "vector", "model": msg.model
                     })
             elif method == "bm25":
                 for msg, score in manager.bm25_search(query, limit=limit):
                     proj_results.append({
                         "id": msg.id, "project": proj_name, "role": msg.role,
                         "content": msg.content, "score": round(score, 4),
-                        "timestamp": str(msg.timestamp), "method": "bm25"
+                        "timestamp": str(msg.timestamp), "method": "bm25", "model": msg.model
                     })
             elif method == "fuzzy":
                 for msg in manager.search_memory(query, fuzzy=True, threshold=threshold):
                     proj_results.append({
                         "id": msg.id, "project": proj_name, "role": msg.role,
                         "content": msg.content, "score": 0,
-                        "timestamp": str(msg.timestamp), "method": "fuzzy"
+                        "timestamp": str(msg.timestamp), "method": "fuzzy", "model": msg.model
                     })
             else:  # combined - 真正的加权融合
                 # 分别获取两种搜索结果
@@ -463,7 +505,7 @@ def unified_search():
                         "id": msg.id, "project": proj_name, "role": msg.role,
                         "content": msg.content, "score": round(combined_scores[msg_id], 4),
                         "timestamp": str(msg.timestamp), "method": source,
-                        "vector_score": round(v_s, 3), "bm25_score": round(b_s, 3)
+                        "vector_score": round(v_s, 3), "bm25_score": round(b_s, 3), "model": msg.model
                     })
 
             return proj_results
@@ -750,7 +792,7 @@ def get_summary_debug(project_name):
         "pending_count": latest_msg_id - last_summary_end_id if latest_msg_id > last_summary_end_id else 0,
         "using_custom_template": using_custom,
         "previous_context": previous_context[:1000] + "..." if len(previous_context) > 1000 else previous_context,
-        "messages": [{"id": m.id, "role": m.role, "content": m.content[:max_chars_per_message] if len(m.content) > max_chars_per_message else m.content, "is_summarized": m.is_summarized, "session_id": m.session_id} for m in messages],
+        "messages": [{"id": m.id, "role": m.role, "content": m.content[:max_chars_per_message] if len(m.content) > max_chars_per_message else m.content, "is_summarized": m.is_summarized, "session_id": m.session_id, "model": m.model} for m in messages],
         "formatted_conversation": conversation,
         "full_prompt": prompt,
     })
@@ -1468,14 +1510,28 @@ def index():
             const res = await fetch('/api/projects');
             const data = await res.json();
             projects = data.projects;
+            const totals = data.totals || {};
+
+            // 格式化 token 数量
+            const formatTokens = (n) => {
+                if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
+                if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+                return n.toString();
+            };
 
             // Stats
             let totalMsgs = 0, totalSums = 0;
-            projects.forEach(p => { totalMsgs += p.messages || 0; totalSums += p.summaries || 0; });
+            projects.forEach(p => {
+                totalMsgs += p.messages || 0;
+                totalSums += p.summaries || 0;
+            });
             document.getElementById('stats').innerHTML = `
                 <div class="card stat"><div class="stat-value">${projects.length}</div><div class="stat-label">Projects</div></div>
                 <div class="card stat"><div class="stat-value">${totalMsgs}</div><div class="stat-label">Total Messages</div></div>
                 <div class="card stat"><div class="stat-value">${totalSums}</div><div class="stat-label">Summaries</div></div>
+                <div class="card stat"><div class="stat-value">${formatTokens(totals.input_tokens || 0)}</div><div class="stat-label">Input Tokens</div></div>
+                <div class="card stat"><div class="stat-value">${formatTokens(totals.output_tokens || 0)}</div><div class="stat-label">Output Tokens</div></div>
+                <div class="card stat" style="background: linear-gradient(135deg, #1a1a2e 0%, #2d1f3d 100%);"><div class="stat-value" style="color: #f39c12;">$${(totals.total_cost || 0).toFixed(2)}</div><div class="stat-label">Total Cost</div></div>
             `;
 
             // Project list
@@ -1483,6 +1539,11 @@ def index():
                 <div class="card" style="cursor: pointer;" onclick="selectProject('${p.name}')">
                     <div class="card-header"><strong>${p.name}</strong><span class="badge">${p.messages || 0} msgs</span></div>
                     <div>Sessions: ${p.sessions || 0} | Summaries: ${p.summaries || 0}</div>
+                    <div style="margin-top: 6px; font-size: 12px; color: #aaa;">
+                        <span title="Input tokens">📥 ${formatTokens(p.input_tokens || 0)}</span>
+                        <span style="margin-left: 8px;" title="Output tokens">📤 ${formatTokens(p.output_tokens || 0)}</span>
+                        <span style="margin-left: 8px; color: #f39c12;" title="Cost">💰 $${(p.cost || 0).toFixed(4)}</span>
+                    </div>
                 </div>
             `).join('');
 
@@ -1594,11 +1655,17 @@ def index():
             return [{ type: 'text', content: content }];
         }
 
+        function formatModelName(model) {
+            if (!model) return 'Assistant';
+            return model;
+        }
+
         function renderAssistantMessage(m) {
             const parts = parseAssistantContent(m.content);
+            const modelLabel = formatModelName(m.model);
             let html = `<div style="display: flex; justify-content: flex-start; margin-bottom: 20px;">
                 <div style="max-width: 85%; width: 100%;">
-                    <div style="font-size: 0.75em; color: #e94560; margin-bottom: 8px; font-weight: bold;">Assistant <span style="color: #666; font-weight: normal;">#${m.id}</span></div>`;
+                    <div style="font-size: 0.75em; color: #e94560; margin-bottom: 8px; font-weight: bold;">${modelLabel} <span style="color: #666; font-weight: normal;">#${m.id}</span></div>`;
 
             for (const part of parts) {
                 if (part.type === 'thinking') {
@@ -1830,9 +1897,10 @@ def index():
                 const excludedBadge = isExcluded ? '<span style="background: #666; color: #ccc; padding: 1px 4px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">未包含</span>' : '';
                 const truncatedBadge = isTruncated && !isExcluded ? `<span style="background: #4a3000; color: #ffcc00; padding: 1px 4px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">截断至${maxPerMsg}字</span>` : '';
 
+                const roleLabel = isUser ? 'You' : formatModelName(m.model);
                 return `<div style="display: flex; justify-content: ${isUser ? 'flex-end' : 'flex-start'}; margin-bottom: 10px; ${excludedStyle}">
                     <div style="max-width: 90%; background: ${bgColor}; border-radius: 8px; padding: 10px; border-left: 3px solid ${borderColor};">
-                        <div style="font-size: 0.7em; color: ${borderColor}; font-weight: bold;">${isUser ? 'You' : 'Assistant'} <span style="color: #666; font-weight: normal;">#${m.id}</span>${excludedBadge}${truncatedBadge}</div>
+                        <div style="font-size: 0.7em; color: ${borderColor}; font-weight: bold;">${roleLabel} <span style="color: #666; font-weight: normal;">#${m.id}</span>${excludedBadge}${truncatedBadge}</div>
                         <div style="white-space: pre-wrap; word-break: break-word; font-size: 0.85em; color: #eee;">${escapeHtml(displayContent)}${isTruncated && !isExcluded ? '<span style="color: #888;">...</span>' : ''}</div>
                     </div>
                 </div>`;
@@ -2066,6 +2134,7 @@ def index():
                     const isUser = r.role === 'user';
                     const bgColor = isUser ? '#1a3a5c' : '#2d1f3d';
                     const borderColor = isUser ? '#00d9ff' : '#e94560';
+                    const roleLabel = isUser ? 'user' : formatModelName(r.model);
                     const methodBadge = r.method ? `<span style="background: ${r.method === 'vector' ? '#4a90d9' : '#d94a90'}; color: #fff; padding: 1px 6px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">${r.method}</span>` : '';
                     const scoreBadge = r.score > 0 ? `<span style="color: #888; font-size: 0.8em; margin-left: 8px;">score: ${r.score}</span>` : '';
                     const projectBadge = scope === 'all' ? `<span class="badge" style="margin-left: 5px;">${r.project}</span>` : '';
@@ -2073,7 +2142,7 @@ def index():
                     <div class="card" style="margin-bottom: 10px; background: ${bgColor}; border-left: 3px solid ${borderColor};">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                             <div>
-                                <span style="color: ${borderColor}; font-weight: bold;">${r.role}</span>
+                                <span style="color: ${borderColor}; font-weight: bold;">${roleLabel}</span>
                                 ${projectBadge}${methodBadge}${scoreBadge}
                             </div>
                             <span style="color: #666; font-size: 0.75em;">${r.timestamp}</span>

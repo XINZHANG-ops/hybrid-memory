@@ -67,6 +67,15 @@ class ConfigUpdate(BaseModel):
 def list_projects():
     projects = get_project_list()
     result = []
+
+    # 从全局数据库获取价格配置
+    global_db = Database(GLOBAL_DB) if GLOBAL_DB.exists() else None
+    input_price = float(global_db.get_config("input_token_price", "0.003")) if global_db else 0.003
+    output_price = float(global_db.get_config("output_token_price", "0.015")) if global_db else 0.015
+
+    total_input_tokens = 0
+    total_output_tokens = 0
+
     for p in projects:
         db_path = PROJECTS_DIR / f"{p}.db"
         try:
@@ -75,15 +84,53 @@ def list_projects():
                 msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
                 session_count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
                 summary_count = conn.execute("SELECT COUNT(*) FROM summaries").fetchone()[0]
+                # Token 统计（兼容旧数据库无 token_usage 表）
+                try:
+                    token_row = conn.execute(
+                        "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) FROM token_usage"
+                    ).fetchone()
+                    input_tokens = token_row[0]
+                    output_tokens = token_row[1]
+                except Exception:
+                    input_tokens = 0
+                    output_tokens = 0
+
+            total_input_tokens += input_tokens
+            total_output_tokens += output_tokens
+
+            # 计算费用
+            input_cost = (input_tokens / 1000) * input_price
+            output_cost = (output_tokens / 1000) * output_price
+
             result.append({
                 "name": p,
                 "messages": msg_count,
                 "sessions": session_count,
                 "summaries": summary_count,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost": round(input_cost + output_cost, 4),
             })
         except Exception as e:
             result.append({"name": p, "error": str(e)})
-    return {"projects": result, "global_db": str(GLOBAL_DB)}
+
+    # 计算总费用
+    total_input_cost = (total_input_tokens / 1000) * input_price
+    total_output_cost = (total_output_tokens / 1000) * output_price
+
+    return {
+        "projects": result,
+        "global_db": str(GLOBAL_DB),
+        "totals": {
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "input_cost": round(total_input_cost, 4),
+            "output_cost": round(total_output_cost, 4),
+            "total_cost": round(total_input_cost + total_output_cost, 4),
+            "input_price_per_1k": input_price,
+            "output_price_per_1k": output_price,
+        }
+    }
 
 
 @app.get("/api/projects/{project_name}/sessions")

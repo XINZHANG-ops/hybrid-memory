@@ -14,6 +14,7 @@ class Message:
     timestamp: datetime = field(default_factory=datetime.now)
     token_count: int = 0
     is_summarized: bool = False
+    model: str = ""
 
 
 @dataclass

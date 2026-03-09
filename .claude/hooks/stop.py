@@ -60,11 +60,36 @@ def is_real_user_message(msg: dict) -> bool:
     return True
 
 
+def estimate_tokens(text: str) -> int:
+    """估算文本的 token 数量
+
+    粗略估算：1 token ≈ 4 英文字符 或 1.5 中文字符
+    """
+    if not text:
+        return 0
+    # 统计中文字符数
+    chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+    other_chars = len(text) - chinese_chars
+    # 中文约 1.5 字符/token，其他约 4 字符/token
+    return int(chinese_chars / 1.5 + other_chars / 4)
+
+
 def extract_token_usage_from_transcript(transcript_path: str) -> dict:
-    """从 transcript 文件中提取 token 使用信息"""
-    total_input = 0
-    total_output = 0
+    """从 transcript 文件中提取 token 使用信息
+
+    Claude API 的 usage 字段包含：
+    - input_tokens: 不包含缓存的新输入 token
+    - cache_creation_input_tokens: 用于创建缓存的 token
+    - cache_read_input_tokens: 从缓存读取的 token
+
+    真实输入 = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+
+    Output tokens 由于 Claude Code transcript 格式限制无法准确获取，
+    改用文本内容长度估算（包含 thinking、text、tool_use）。
+    """
     model = ""
+    # 按消息 id 分组
+    message_usage = {}  # {msg_id: {"input": ..., "output_text": "", "model": ...}}
 
     try:
         path = Path(transcript_path)
@@ -78,19 +103,60 @@ def extract_token_usage_from_transcript(transcript_path: str) -> dict:
                     continue
                 try:
                     msg = json.loads(line)
-                    # Claude Code transcript 中 assistant 消息包含 usage 信息
                     if msg.get("type") == "assistant" and "message" in msg:
                         inner_msg = msg.get("message", {})
+                        msg_id = inner_msg.get("id", "")
+                        msg_model = inner_msg.get("model", "")
+
+                        # 跳过 synthetic 消息
+                        if msg_model == "<synthetic>":
+                            continue
+
+                        if not msg_id:
+                            continue
+
                         usage = inner_msg.get("usage", {})
-                        if usage:
-                            total_input += usage.get("input_tokens", 0)
-                            total_output += usage.get("output_tokens", 0)
-                        if not model:
-                            model = inner_msg.get("model", "")
+                        content = inner_msg.get("content", [])
+
+                        # 初始化消息记录
+                        if msg_id not in message_usage:
+                            input_tokens = (
+                                usage.get("input_tokens", 0) +
+                                usage.get("cache_creation_input_tokens", 0) +
+                                usage.get("cache_read_input_tokens", 0)
+                            ) if usage else 0
+                            message_usage[msg_id] = {
+                                "input": input_tokens,
+                                "output_text": "",
+                                "model": msg_model
+                            }
+
+                        # 收集所有输出内容用于估算
+                        if isinstance(content, list):
+                            for part in content:
+                                if isinstance(part, dict):
+                                    part_type = part.get("type", "")
+                                    if part_type == "thinking":
+                                        message_usage[msg_id]["output_text"] += part.get("thinking", "")
+                                    elif part_type == "text":
+                                        message_usage[msg_id]["output_text"] += part.get("text", "")
+                                    elif part_type == "tool_use":
+                                        # 工具调用也计入 output
+                                        tool_name = part.get("name", "")
+                                        tool_input = json.dumps(part.get("input", {}), ensure_ascii=False)
+                                        message_usage[msg_id]["output_text"] += f"{tool_name}: {tool_input}"
+
+                        if not model and msg_model:
+                            model = msg_model
                 except json.JSONDecodeError:
                     continue
 
-        logger.debug(f"Token usage from transcript: input={total_input}, output={total_output}, model={model}")
+        # 汇总所有消息的 token
+        total_input = sum(m["input"] for m in message_usage.values())
+        # Output 使用估算
+        total_output = sum(estimate_tokens(m["output_text"]) for m in message_usage.values())
+
+        logger.debug(f"Token usage from transcript: input={total_input}, output={total_output} (estimated), model={model}, msg_count={len(message_usage)}")
         return {"input_tokens": total_input, "output_tokens": total_output, "model": model}
     except Exception as e:
         logger.error(f"Error extracting token usage: {e}")
@@ -255,15 +321,16 @@ def main():
             response = sanitize_text(response)
             logger.debug(f"Response preview: {response[:100]}...")
 
+            model_name = token_usage_data.get("model", "")
             publish_event("message", f"Saving message ({len(response)} chars)", project_name)
 
             # 1. 保存到项目级数据库
-            project_msg = project_manager.add_message(session_id, "assistant", response)
-            logger.info(f"[Project] Assistant message saved: id={project_msg.id}")
+            project_msg = project_manager.add_message(session_id, "assistant", response, model=model_name)
+            logger.info(f"[Project] Assistant message saved: id={project_msg.id}, model={model_name}")
 
             # 2. 保存到全局数据库
-            global_msg = global_manager.add_message(global_session_id, "assistant", response)
-            logger.info(f"[Global] Assistant message saved: id={global_msg.id}")
+            global_msg = global_manager.add_message(global_session_id, "assistant", response, model=model_name)
+            logger.info(f"[Global] Assistant message saved: id={global_msg.id}, model={model_name}")
 
         else:
             logger.warning("Empty response, skipping save")

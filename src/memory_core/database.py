@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS messages (
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     token_count INTEGER DEFAULT 0,
     is_summarized BOOLEAN DEFAULT 0,
+    model TEXT DEFAULT '',
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
@@ -84,6 +85,12 @@ class Database:
         logger.debug("Creating database schema if not exists")
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            # Migration: add model column to messages if not exists
+            try:
+                conn.execute("SELECT model FROM messages LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("Migrating: adding model column to messages table")
+                conn.execute("ALTER TABLE messages ADD COLUMN model TEXT DEFAULT ''")
         logger.debug("Schema initialization complete")
 
     @contextmanager
@@ -145,11 +152,11 @@ class Database:
         logger.info(f"Session ended: {session_id}")
 
     def add_message(self, message: Message) -> Message:
-        logger.debug(f"Adding message: session={message.session_id}, role={message.role}, tokens={message.token_count}")
+        logger.debug(f"Adding message: session={message.session_id}, role={message.role}, tokens={message.token_count}, model={message.model}")
         with self._connect() as conn:
             cursor = conn.execute(
-                """INSERT INTO messages (session_id, role, content, timestamp, token_count, is_summarized)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO messages (session_id, role, content, timestamp, token_count, is_summarized, model)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     message.session_id,
                     message.role,
@@ -157,10 +164,11 @@ class Database:
                     message.timestamp,
                     message.token_count,
                     message.is_summarized,
+                    message.model,
                 ),
             )
             message.id = cursor.lastrowid
-            logger.info(f"Message added: id={message.id}, session={message.session_id}, role={message.role}")
+            logger.info(f"Message added: id={message.id}, session={message.session_id}, role={message.role}, model={message.model}")
             logger.debug(f"Message content preview: {message.content[:100]}...")
             return message
 
@@ -344,6 +352,7 @@ class Database:
             timestamp=row["timestamp"] if isinstance(row["timestamp"], datetime) else datetime.fromisoformat(row["timestamp"]),
             token_count=row["token_count"],
             is_summarized=bool(row["is_summarized"]),
+            model=row["model"] if "model" in row.keys() else "",
         )
 
     def _row_to_summary(self, row: sqlite3.Row) -> Summary:

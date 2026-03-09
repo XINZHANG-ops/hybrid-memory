@@ -10,15 +10,16 @@ class ShortTermMemory:
         self.max_tokens = max_tokens
         logger.info(f"ShortTermMemory initialized: window_size={window_size}, max_tokens={max_tokens}")
 
-    def add(self, session_id: str, role: str, content: str, token_count: int = 0) -> Message:
+    def add(self, session_id: str, role: str, content: str, token_count: int = 0, model: str = "") -> Message:
         estimated_tokens = token_count or self._estimate_tokens(content)
-        logger.debug(f"ShortTermMemory.add: session={session_id}, role={role}, tokens={estimated_tokens}")
+        logger.debug(f"ShortTermMemory.add: session={session_id}, role={role}, tokens={estimated_tokens}, model={model}")
         message = Message(
             id=None,
             session_id=session_id,
             role=role,
             content=content,
             token_count=estimated_tokens,
+            model=model,
         )
         saved = self.db.add_message(message)
         logger.debug(f"Message saved to short-term memory: id={saved.id}")

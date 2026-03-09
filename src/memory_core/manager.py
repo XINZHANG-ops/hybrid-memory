@@ -115,12 +115,12 @@ class MemoryManager:
         # Resume 时也更新活动时间，确保时间显示为最新
         self.db.update_session_activity(session_id)
 
-    def add_message(self, session_id: str, role: str, content: str) -> Message:
-        logger.debug(f"MemoryManager.add_message: session={session_id}, role={role}")
+    def add_message(self, session_id: str, role: str, content: str, model: str = "") -> Message:
+        logger.debug(f"MemoryManager.add_message: session={session_id}, role={role}, model={model}")
         self.db.create_session(session_id)
         self.db.update_session_activity(session_id)
-        message = self.short_term.add(session_id, role, content)
-        logger.info(f"Message added to session {session_id}: id={message.id}")
+        message = self.short_term.add(session_id, role, content, model=model)
+        logger.info(f"Message added to session {session_id}: id={message.id}, model={model}")
 
         # 实时生成 embedding 并索引
         if self.enable_vector_search and self.embedding_client and self.vector_store:
