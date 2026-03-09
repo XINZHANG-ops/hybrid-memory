@@ -3,24 +3,22 @@ from loguru import logger
 from .models import Message
 from .llm_client import LLMClient
 from .prompts import EXTRACTION_PROMPT, CONDENSE_PROMPT, CATEGORY_NAMES, ROLE_LABELS, UI_TEXT
-
-# 默认值（可通过配置覆盖）
-DEFAULT_MAX_CHARS_PER_MESSAGE = 500
+from .content_processor import ContentConfig, process_content
 
 
 class KnowledgeExtractor:
     def __init__(
         self,
         llm_client: LLMClient,
-        max_chars_per_message: int = DEFAULT_MAX_CHARS_PER_MESSAGE,
+        content_config: ContentConfig | None = None,
         extraction_prompt: str = "",
         condense_prompt: str = "",
     ):
         self.llm = llm_client
-        self.max_chars_per_message = max_chars_per_message
+        self.content_config = content_config or ContentConfig()
         self.extraction_prompt = extraction_prompt
         self.condense_prompt = condense_prompt
-        logger.info(f"KnowledgeExtractor initialized (max_per_msg={max_chars_per_message})")
+        logger.info(f"KnowledgeExtractor initialized (content_config={self.content_config})")
 
     def extract(self, messages: list[Message], existing_knowledge: dict | None = None) -> dict:
         if not messages:
@@ -64,10 +62,11 @@ class KnowledgeExtractor:
 
     def _format_conversation(self, messages: list[Message]) -> str:
         lines = []
-        max_len = self.max_chars_per_message
         for msg in messages:
             role_label = ROLE_LABELS.get(msg.role, msg.role)
-            content = msg.content[:max_len] if len(msg.content) > max_len else msg.content
+            content = process_content(msg.content, self.content_config)
+            if not content:
+                continue  # 用户关闭了所有类型，跳过此消息
             lines.append(f"{role_label}: {content}")
         return "\n".join(lines)
 

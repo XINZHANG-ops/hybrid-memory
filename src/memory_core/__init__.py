@@ -10,11 +10,13 @@ from .prompts import (
     CATEGORY_NAMES, ROLE_LABELS
 )
 from .events import publish_event
+from .content_processor import ContentConfig, ContentBlock, process_content, process_messages, config_from_dict
 
 __all__ = [
     "MemoryManager", "Message", "Summary", "Session", "TokenUsage", "Interaction", "Database",
     "ConfigManager", "load_config", "DEFAULT_CONFIG", "CONFIG_META",
     "EmbeddingClient", "VectorStore", "KnowledgeExtractor", "publish_event",
     "EXTRACTION_PROMPT", "CONDENSE_PROMPT", "SUMMARY_PROMPT", "SUMMARY_PROMPT_WITH_CONTEXT",
-    "CATEGORY_NAMES", "ROLE_LABELS"
+    "CATEGORY_NAMES", "ROLE_LABELS",
+    "ContentConfig", "ContentBlock", "process_content", "process_messages", "config_from_dict"
 ]

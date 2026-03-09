@@ -12,6 +12,10 @@ from .embedding_client import EmbeddingClient
 from .vector_store import VectorStore
 from .knowledge_extractor import KnowledgeExtractor
 from .events import publish_event
+from .content_processor import ContentConfig
+
+# 搜索结果预览截断长度
+SEARCH_PREVIEW_LENGTH = 300
 
 
 class MemoryManager:
@@ -35,10 +39,15 @@ class MemoryManager:
         enable_knowledge_extraction: bool = True,
         # 总结配置
         summary_max_chars_total: int = 8000,
-        summary_max_chars_per_message: int = 500,
         # 知识提取配置
-        knowledge_max_chars_per_message: int = 500,
         knowledge_max_items_per_category: int = 10,
+        # 内容处理配置
+        content_include_thinking: bool = False,
+        content_include_tool: bool = True,
+        content_include_text: bool = True,
+        content_max_chars_thinking: int = 200,
+        content_max_chars_tool: int = 300,
+        content_max_chars_text: int = 500,
         # Prompt 模板
         summary_prompt_template: str = "",
         knowledge_extraction_prompt: str = "",
@@ -66,10 +75,19 @@ class MemoryManager:
         self.short_term = ShortTermMemory(
             self.db, window_size=short_term_window_size, max_tokens=max_context_tokens
         )
+        # 创建统一的内容处理配置
+        self.content_config = ContentConfig(
+            include_thinking=content_include_thinking,
+            include_tool=content_include_tool,
+            include_text=content_include_text,
+            max_chars_thinking=content_max_chars_thinking,
+            max_chars_tool=content_max_chars_tool,
+            max_chars_text=content_max_chars_text,
+        )
         self.summarizer = SummaryGenerator(
             self._llm,
             max_chars_total=summary_max_chars_total,
-            max_chars_per_message=summary_max_chars_per_message,
+            content_config=self.content_config,
         )
         self.long_term = LongTermMemory(
             self.db, self.summarizer, trigger_threshold=summary_trigger_threshold
@@ -77,7 +95,6 @@ class MemoryManager:
         self.retriever = MemoryRetriever(self.db)
 
         # 保存配置供其他模块使用
-        self.knowledge_max_chars_per_message = knowledge_max_chars_per_message
         self.summary_prompt_template = summary_prompt_template
         self.knowledge_extraction_prompt = knowledge_extraction_prompt
         self.knowledge_condense_prompt = knowledge_condense_prompt
@@ -104,7 +121,7 @@ class MemoryManager:
         if enable_knowledge_extraction:
             self.knowledge_extractor = KnowledgeExtractor(
                 self._llm,
-                max_chars_per_message=knowledge_max_chars_per_message,
+                content_config=self.content_config,
                 extraction_prompt=knowledge_extraction_prompt,
                 condense_prompt=knowledge_condense_prompt,
             )
@@ -304,7 +321,7 @@ class MemoryManager:
         if query and self.enable_vector_search:
             vector_results = self.vector_search(query, k=5)
             context["related_memories"] = [
-                {"role": msg.role, "content": msg.content[:200], "score": score}
+                {"role": msg.role, "content": msg.content[:SEARCH_PREVIEW_LENGTH], "score": score}
                 for msg, score in vector_results
             ]
 

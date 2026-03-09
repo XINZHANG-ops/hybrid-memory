@@ -2,10 +2,10 @@ from loguru import logger
 from .models import Message, Interaction
 from .llm_client import LLMClient
 from .prompts import SUMMARY_PROMPT, SUMMARY_PROMPT_WITH_CONTEXT, ROLE_LABELS
+from .content_processor import ContentConfig, process_content
 
 # 默认值（可通过配置覆盖）
 DEFAULT_MAX_CHARS_TOTAL = 8000
-DEFAULT_MAX_CHARS_PER_MESSAGE = 500
 
 
 class SummaryGenerator:
@@ -13,19 +13,19 @@ class SummaryGenerator:
         self,
         llm_client: LLMClient,
         max_chars_total: int = DEFAULT_MAX_CHARS_TOTAL,
-        max_chars_per_message: int = DEFAULT_MAX_CHARS_PER_MESSAGE,
+        content_config: ContentConfig | None = None,
     ):
         self.llm = llm_client
         self.max_chars_total = max_chars_total
-        self.max_chars_per_message = max_chars_per_message
-        logger.info(f"SummaryGenerator initialized (max_total={max_chars_total}, max_per_msg={max_chars_per_message})")
+        self.content_config = content_config or ContentConfig()
+        logger.info(f"SummaryGenerator initialized (max_total={max_chars_total}, content_config={self.content_config})")
 
     def generate(self, messages: list[Message], previous_context: str = "", custom_template: str = "", interactions: list[Interaction] | None = None) -> str:
         if not messages:
             logger.debug("No messages to summarize")
             return ""
         logger.info(f"Generating summary for {len(messages)} messages (with context: {len(previous_context)} chars, interactions: {len(interactions) if interactions else 0})")
-        conversation = self._format_conversation(messages, self.max_chars_total, self.max_chars_per_message, interactions)
+        conversation = self._format_conversation(messages, self.max_chars_total, interactions)
         logger.debug(f"Formatted conversation length: {len(conversation)} chars")
 
         if custom_template and custom_template.strip():
@@ -61,11 +61,10 @@ class SummaryGenerator:
         self,
         messages: list[Message],
         max_chars_total: int = DEFAULT_MAX_CHARS_TOTAL,
-        max_chars_per_message: int = DEFAULT_MAX_CHARS_PER_MESSAGE,
         interactions: list[Interaction] | None = None,
     ) -> str:
-        """格式化对话内容，限制总长度避免 prompt 过长"""
-        logger.debug(f"Formatting {len(messages)} messages for summary (max_total={max_chars_total}, max_per_msg={max_chars_per_message})")
+        """格式化对话内容，使用 content_processor 解析和截断"""
+        logger.debug(f"Formatting {len(messages)} messages for summary (max_total={max_chars_total})")
         lines = []
         total_chars = 0
 
@@ -75,8 +74,10 @@ class SummaryGenerator:
         # 优先保留最近的消息
         for i, msg in enumerate(reversed(messages)):
             role_label = ROLE_LABELS.get(msg.role, msg.role)
-            # 每条消息最多 max_chars_per_message 字符
-            content = msg.content[:max_chars_per_message] if len(msg.content) > max_chars_per_message else msg.content
+            # 使用 content_processor 处理内容
+            content = process_content(msg.content, self.content_config)
+            if not content:
+                continue  # 用户关闭了所有类型，跳过此消息
 
             # 为助手消息附加关联的 interactions
             interaction_text = ""
@@ -87,7 +88,7 @@ class SummaryGenerator:
                 if related:
                     int_lines = []
                     for intr in related:
-                        response_label = "批准" if intr.user_response == "yes" else ("拒绝" if intr.user_response == "no" else intr.user_response)
+                        response_label = "approved" if intr.user_response == "yes" else ("rejected" if intr.user_response == "no" else intr.user_response)
                         int_lines.append(f"  [{intr.type}] {intr.tool_name}: {response_label}")
                     interaction_text = "\n" + "\n".join(int_lines)
 

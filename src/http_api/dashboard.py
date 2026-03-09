@@ -37,7 +37,8 @@ logger.add(
 )
 from src.memory_core import (
     MemoryManager, ConfigManager, DEFAULT_CONFIG, CONFIG_META,
-    EXTRACTION_PROMPT, CONDENSE_PROMPT, SUMMARY_PROMPT, SUMMARY_PROMPT_WITH_CONTEXT
+    EXTRACTION_PROMPT, CONDENSE_PROMPT, SUMMARY_PROMPT, SUMMARY_PROMPT_WITH_CONTEXT,
+    ContentConfig, process_content
 )
 from src.memory_core.database import Database
 
@@ -178,9 +179,32 @@ def get_messages_range(project_name):
     end = int(request.args.get("end", 0))
     db = Database(db_path)
     messages = db.get_messages_in_range(start, end)
-    return json_response({
-        "messages": [{"id": m.id, "role": m.role, "content": m.content, "timestamp": str(m.timestamp), "model": m.model} for m in messages]
-    })
+
+    # 加载内容处理配置
+    from src.memory_core.config import load_config
+    config_mgr = load_config(GLOBAL_DB)
+    content_config = ContentConfig(
+        include_thinking=config_mgr.get("content_include_thinking").lower() == "true",
+        include_tool=config_mgr.get("content_include_tool").lower() == "true",
+        include_text=config_mgr.get("content_include_text").lower() == "true",
+        max_chars_thinking=config_mgr.get_int("content_max_chars_thinking"),
+        max_chars_tool=config_mgr.get_int("content_max_chars_tool"),
+        max_chars_text=config_mgr.get_int("content_max_chars_text"),
+    )
+
+    result_messages = []
+    for m in messages:
+        processed = process_content(m.content, content_config)
+        result_messages.append({
+            "id": m.id,
+            "role": m.role,
+            "content": m.content,
+            "processed_content": processed,
+            "timestamp": str(m.timestamp),
+            "model": m.model
+        })
+
+    return json_response({"messages": result_messages})
 
 
 @app.route("/api/projects/<project_name>/summaries")
@@ -242,6 +266,7 @@ def update_summary(project_name, summary_id):
 
 @app.route("/api/projects/<project_name>/summaries/<int:summary_id>/regenerate", methods=["POST"])
 def regenerate_summary(project_name, summary_id):
+    from src.memory_core.events import publish_event
     db_path = PROJECTS_DIR / f"{project_name}.db"
     if not db_path.exists():
         return json_response({"error": "Project not found"}), 404
@@ -254,6 +279,9 @@ def regenerate_summary(project_name, summary_id):
     messages = db.get_messages_in_range(summary.message_range_start, summary.message_range_end)
     if not messages:
         return json_response({"error": "No messages found in range"}), 400
+
+    publish_event("summary", f"Regenerating summary #{summary_id} ({len(messages)} messages)", project_name)
+
     from src.memory_core.config import load_config
     from src.memory_core.summarizer import SummaryGenerator
     from src.memory_core.llm_client import create_llm_client
@@ -272,11 +300,15 @@ def regenerate_summary(project_name, summary_id):
     previous_context = "\n\n---\n\n".join(s.summary_text for s in earlier[:3]) if earlier else ""
     new_text = generator.generate(messages, previous_context, custom_template)
     db.update_summary_text(summary_id, new_text)
+
+    publish_event("summary_done", f"Summary #{summary_id} regenerated", project_name)
+
     return json_response({"status": "ok", "summary_text": new_text})
 
 
 @app.route("/api/projects/<project_name>/summaries/regenerate-all", methods=["POST"])
 def regenerate_all_summaries(project_name):
+    from src.memory_core.events import publish_event
     db_path = PROJECTS_DIR / f"{project_name}.db"
     if not db_path.exists():
         return json_response({"error": "Project not found"}), 404
@@ -296,6 +328,9 @@ def regenerate_all_summaries(project_name):
     generator = SummaryGenerator(llm_client)
     all_summaries = db.get_all_summaries(limit=100)
     all_summaries.sort(key=lambda s: s.id)
+
+    publish_event("summary", f"Regenerating all {len(all_summaries)} summaries", project_name)
+
     regenerated = 0
     for i, summary in enumerate(all_summaries):
         if not summary.message_range_start or not summary.message_range_end:
@@ -303,10 +338,14 @@ def regenerate_all_summaries(project_name):
         messages = db.get_messages_in_range(summary.message_range_start, summary.message_range_end)
         if not messages:
             continue
+        publish_event("summary", f"Regenerating summary {i+1}/{len(all_summaries)}", project_name)
         previous_context = "\n\n---\n\n".join(s.summary_text for s in all_summaries[:i][-3:]) if i > 0 else ""
         new_text = generator.generate(messages, previous_context, custom_template)
         db.update_summary_text(summary.id, new_text)
         regenerated += 1
+
+    publish_event("summary_done", f"All summaries regenerated ({regenerated} total)", project_name)
+
     return json_response({"status": "ok", "regenerated": regenerated})
 
 
@@ -351,7 +390,6 @@ def get_context(project_name):
     config_mgr = load_config(GLOBAL_DB)
     inject_summary_count = config_mgr.get_int("inject_summary_count")
     inject_recent_count = config_mgr.get_int("inject_recent_count")
-    inject_preview_length = config_mgr.get_int("inject_preview_length")
     inject_knowledge_count = config_mgr.get_int("inject_knowledge_count")
     inject_task_count = config_mgr.get_int("inject_task_count")
 
@@ -390,15 +428,26 @@ def get_context(project_name):
         "important_context": raw_knowledge.get("important_context", [])[:inject_knowledge_count],
     }
 
-    # 截取消息内容（与注入时一致）
-    def truncate(text, max_len):
-        if max_len <= 0 or len(text) <= max_len:
-            return text
-        return text[:max_len] + "..."
+    # 使用 content_processor 处理消息内容（与 sessionStart.py 完全一致）
+    content_config = ContentConfig(
+        include_thinking=config_mgr.get("content_include_thinking").lower() == "true",
+        include_tool=config_mgr.get("content_include_tool").lower() == "true",
+        include_text=config_mgr.get("content_include_text").lower() == "true",
+        max_chars_thinking=config_mgr.get_int("content_max_chars_thinking"),
+        max_chars_tool=config_mgr.get_int("content_max_chars_tool"),
+        max_chars_text=config_mgr.get_int("content_max_chars_text"),
+    )
+
+    processed_messages = []
+    for m in reversed(recent_messages) if recent_messages else []:
+        processed = process_content(m.content, content_config)
+        if not processed:
+            continue  # 用户关闭了所有类型，跳过此消息
+        processed_messages.append({"role": m.role, "content": processed})
 
     context = {
         "summaries": "\n\n---\n\n".join(s.summary_text for s in summaries) if summaries else "",
-        "messages": [{"role": m.role, "content": truncate(m.content, inject_preview_length)} for m in reversed(recent_messages)] if recent_messages else [],
+        "messages": processed_messages,
         "knowledge": knowledge
     }
     return json_response(context)
@@ -673,8 +722,15 @@ def extract_knowledge(project_name):
         ollama_keep_alive=config_mgr.get("ollama_keep_alive"),
     )
 
-    max_chars = config_mgr.get_int("knowledge_max_chars_per_message")
-    extractor = KnowledgeExtractor(llm_client, max_chars_per_message=max_chars)
+    content_config = ContentConfig(
+        include_thinking=config_mgr.get("content_include_thinking").lower() == "true",
+        include_tool=config_mgr.get("content_include_tool").lower() == "true",
+        include_text=config_mgr.get("content_include_text").lower() == "true",
+        max_chars_thinking=config_mgr.get_int("content_max_chars_thinking"),
+        max_chars_tool=config_mgr.get_int("content_max_chars_tool"),
+        max_chars_text=config_mgr.get_int("content_max_chars_text"),
+    )
+    extractor = KnowledgeExtractor(llm_client, content_config=content_config)
 
     # 获取已有知识，传给提取器避免重复
     existing = db.get_knowledge()
@@ -704,7 +760,14 @@ def get_knowledge_debug(project_name):
         return json_response({"error": "Project not found"}), 404
     db = Database(db_path)
     config_mgr = load_config(GLOBAL_DB)
-    max_chars = config_mgr.get_int("knowledge_max_chars_per_message")
+    content_config = ContentConfig(
+        include_thinking=config_mgr.get("content_include_thinking").lower() == "true",
+        include_tool=config_mgr.get("content_include_tool").lower() == "true",
+        include_text=config_mgr.get("content_include_text").lower() == "true",
+        max_chars_thinking=config_mgr.get_int("content_max_chars_thinking"),
+        max_chars_tool=config_mgr.get_int("content_max_chars_tool"),
+        max_chars_text=config_mgr.get_int("content_max_chars_text"),
+    )
 
     # 获取消息
     messages = db.get_unsummarized_messages()
@@ -713,12 +776,14 @@ def get_knowledge_debug(project_name):
         messages = db.get_recent_messages_all_sessions(limit=20)
         source = "recent_20"
 
-    # 格式化对话（与 KnowledgeExtractor 一致）
+    # 格式化对话（使用 content_processor，与 KnowledgeExtractor 一致）
     from src.memory_core.prompts import ROLE_LABELS, CATEGORY_NAMES, UI_TEXT
     lines = []
     for msg in messages:
         role_label = ROLE_LABELS.get(msg.role, msg.role)
-        content = msg.content[:max_chars] if len(msg.content) > max_chars else msg.content
+        content = process_content(msg.content, content_config)
+        if not content:
+            continue  # 用户关闭了所有类型，跳过此消息
         lines.append(f"{role_label}: {content}")
     conversation = "\n".join(lines)
 
@@ -741,8 +806,15 @@ def get_knowledge_debug(project_name):
     return json_response({
         "message_count": len(messages),
         "message_source": source,
-        "max_chars_per_message": max_chars,
-        "messages": [{"id": m.id, "role": m.role, "content": m.content[:max_chars]} for m in messages],
+        "content_config": {
+            "include_thinking": content_config.include_thinking,
+            "include_tool": content_config.include_tool,
+            "include_text": content_config.include_text,
+            "max_chars_thinking": content_config.max_chars_thinking,
+            "max_chars_tool": content_config.max_chars_tool,
+            "max_chars_text": content_config.max_chars_text,
+        },
+        "messages": [{"id": m.id, "role": m.role, "content": c} for m in messages if (c := process_content(m.content, content_config))],
         "formatted_conversation": conversation,
         "existing_knowledge": existing_str,
         "full_prompt": prompt,
@@ -762,7 +834,14 @@ def get_summary_debug(project_name):
     custom_template = config_mgr.get("summary_prompt_template")
     # 读取配置的截断参数
     max_chars_total = config_mgr.get_int("summary_max_chars_total")
-    max_chars_per_message = config_mgr.get_int("summary_max_chars_per_message")
+    content_config = ContentConfig(
+        include_thinking=config_mgr.get("content_include_thinking").lower() == "true",
+        include_tool=config_mgr.get("content_include_tool").lower() == "true",
+        include_text=config_mgr.get("content_include_text").lower() == "true",
+        max_chars_thinking=config_mgr.get_int("content_max_chars_thinking"),
+        max_chars_tool=config_mgr.get_int("content_max_chars_tool"),
+        max_chars_text=config_mgr.get_int("content_max_chars_text"),
+    )
 
     with db._connect() as conn:
         row = conn.execute("SELECT session_id FROM sessions ORDER BY last_active_at DESC LIMIT 1").fetchone()
@@ -772,13 +851,15 @@ def get_summary_debug(project_name):
     summaries = db.get_summaries(session_id)
     previous_context = "\n\n---\n\n".join(s.summary_text for s in summaries) if summaries else ""
 
-    # 格式化对话 - 与 summarizer._format_conversation 完全一致（使用配置参数）
+    # 格式化对话 - 使用 content_processor，与 summarizer._format_conversation 一致
     from src.memory_core.prompts import ROLE_LABELS as SUMMARY_ROLE_LABELS
     lines = []
     total_chars = 0
     for msg in reversed(messages):
         role_label = SUMMARY_ROLE_LABELS.get(msg.role, msg.role)
-        content = msg.content[:max_chars_per_message] if len(msg.content) > max_chars_per_message else msg.content
+        content = process_content(msg.content, content_config)
+        if not content:
+            continue  # 用户关闭了所有类型，跳过此消息
         line = f"{role_label}: {content}"
         if total_chars + len(line) > max_chars_total:
             break
@@ -816,7 +897,7 @@ def get_summary_debug(project_name):
         "pending_count": latest_msg_id - last_summary_end_id if latest_msg_id > last_summary_end_id else 0,
         "using_custom_template": using_custom,
         "previous_context": previous_context[:1000] + "..." if len(previous_context) > 1000 else previous_context,
-        "messages": [{"id": m.id, "role": m.role, "content": m.content[:max_chars_per_message] if len(m.content) > max_chars_per_message else m.content, "is_summarized": m.is_summarized, "session_id": m.session_id, "model": m.model} for m in messages],
+        "messages": [{"id": m.id, "role": m.role, "content": c, "is_summarized": m.is_summarized, "session_id": m.session_id, "model": m.model} for m in messages if (c := process_content(m.content, content_config))],
         "formatted_conversation": conversation,
         "full_prompt": prompt,
     })
@@ -1471,7 +1552,6 @@ def index():
         // 全局配置（从后端加载）
         let appConfig = {
             summary_max_chars_total: 8000,
-            summary_max_chars_per_message: 500,
             search_result_preview_length: 500,
             dashboard_refresh_interval: 5000,
         };
@@ -1959,16 +2039,15 @@ def index():
             const data = await res.json();
             const messages = data.messages || [];
 
-            // 使用配置的截断逻辑（与 summarizer 一致）
-            const maxPerMsg = appConfig.summary_max_chars_per_message;
+            // 使用 processed_content（后端统一处理）计算哪些消息会被包含
             const maxTotal = appConfig.summary_max_chars_total;
             let totalChars = 0;
             let includedCount = 0;
 
-            // 从后往前计算哪些消息会被包含
+            // 从后往前计算
             const reversed = [...messages].reverse();
             for (const m of reversed) {
-                const contentLen = Math.min(m.content.length, maxPerMsg);
+                const contentLen = (m.processed_content || '').length;
                 if (totalChars + contentLen > maxTotal) break;
                 totalChars += contentLen;
                 includedCount++;
@@ -1987,18 +2066,19 @@ def index():
                 const bgColor = isUser ? '#1a3a5c' : '#2d1f3d';
                 const borderColor = isUser ? '#00d9ff' : '#e94560';
                 const isExcluded = idx < excludedCount;
-                const isTruncated = m.content.length > maxPerMsg;
-                const displayContent = isTruncated ? m.content.substring(0, maxPerMsg) : m.content;
+                // 使用 processed_content 作为显示内容
+                const displayContent = m.processed_content || m.content.substring(0, 200) + '...';
+                const isProcessed = m.processed_content && m.processed_content !== m.content;
 
                 const excludedStyle = isExcluded ? 'opacity: 0.4;' : '';
                 const excludedBadge = isExcluded ? '<span style="background: #666; color: #ccc; padding: 1px 4px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">未包含</span>' : '';
-                const truncatedBadge = isTruncated && !isExcluded ? `<span style="background: #4a3000; color: #ffcc00; padding: 1px 4px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">截断至${maxPerMsg}字</span>` : '';
+                const processedBadge = isProcessed && !isExcluded ? '<span style="background: #1a5a3a; color: #4ade80; padding: 1px 4px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">已处理</span>' : '';
 
                 const roleLabel = isUser ? 'You' : formatModelName(m.model);
                 return `<div style="display: flex; justify-content: ${isUser ? 'flex-end' : 'flex-start'}; margin-bottom: 10px; ${excludedStyle}">
                     <div style="max-width: 90%; background: ${bgColor}; border-radius: 8px; padding: 10px; border-left: 3px solid ${borderColor};">
-                        <div style="font-size: 0.7em; color: ${borderColor}; font-weight: bold;">${roleLabel} <span style="color: #666; font-weight: normal;">#${m.id}</span>${excludedBadge}${truncatedBadge}</div>
-                        <div style="white-space: pre-wrap; word-break: break-word; font-size: 0.85em; color: #eee;">${escapeHtml(displayContent)}${isTruncated && !isExcluded ? '<span style="color: #888;">...</span>' : ''}</div>
+                        <div style="font-size: 0.7em; color: ${borderColor}; font-weight: bold;">${roleLabel} <span style="color: #666; font-weight: normal;">#${m.id}</span>${excludedBadge}${processedBadge}</div>
+                        <div style="white-space: pre-wrap; word-break: break-word; font-size: 0.85em; color: #eee;">${escapeHtml(displayContent)}</div>
                     </div>
                 </div>`;
             }).join('');
@@ -2413,15 +2493,19 @@ def index():
                 },
                 'Knowledge': {
                     icon: '📚',
-                    keys: ['enable_knowledge_extraction', 'knowledge_max_chars_per_message', 'knowledge_max_items_per_category', 'knowledge_auto_condense']
+                    keys: ['enable_knowledge_extraction', 'knowledge_max_items_per_category', 'knowledge_auto_condense']
+                },
+                'Content': {
+                    icon: '📄',
+                    keys: ['content_include_thinking', 'content_include_tool', 'content_include_text', 'content_max_chars_thinking', 'content_max_chars_tool', 'content_max_chars_text']
                 },
                 'Inject': {
                     icon: '💉',
-                    keys: ['inject_summary_count', 'inject_recent_count', 'inject_preview_length', 'inject_knowledge_count', 'inject_task_count']
+                    keys: ['inject_summary_count', 'inject_recent_count', 'inject_knowledge_count', 'inject_task_count']
                 },
                 'Summary': {
                     icon: '📝',
-                    keys: ['summary_max_chars_total', 'summary_max_chars_per_message']
+                    keys: ['summary_max_chars_total']
                 },
                 'Stats': {
                     icon: '📊',
@@ -2497,9 +2581,11 @@ def index():
                 'llm_provider', 'ollama_model', 'ollama_base_url', 'ollama_timeout', 'ollama_keep_alive',
                 'anthropic_model', 'embedding_model', 'embedding_base_url', 'enable_vector_search', 'enable_knowledge_extraction',
                 'input_token_price', 'output_token_price',
-                'inject_summary_count', 'inject_recent_count', 'inject_preview_length', 'inject_knowledge_count', 'inject_task_count',
-                'summary_max_chars_total', 'summary_max_chars_per_message',
-                'knowledge_max_chars_per_message', 'knowledge_max_items_per_category', 'knowledge_auto_condense',
+                'inject_summary_count', 'inject_recent_count', 'inject_knowledge_count', 'inject_task_count',
+                'summary_max_chars_total',
+                'content_include_thinking', 'content_include_tool', 'content_include_text',
+                'content_max_chars_thinking', 'content_max_chars_tool', 'content_max_chars_text',
+                'knowledge_max_items_per_category', 'knowledge_auto_condense',
                 'search_result_preview_length', 'dashboard_refresh_interval',
                 'prompt_language', 'summary_prompt_template', 'knowledge_extraction_prompt', 'knowledge_condense_prompt'
             ];
@@ -2717,8 +2803,10 @@ def index():
             const res = await fetch(`/api/projects/${currentProject}/knowledge-debug`);
             const data = await res.json();
 
+            const cfg = data.content_config || {};
             document.getElementById('knowledge-debug-info').innerHTML = `
-                <div>Source: <strong>${data.message_source}</strong> | Messages: <strong>${data.message_count}</strong> | Max chars/msg: <strong>${data.max_chars_per_message}</strong></div>
+                <div>Source: <strong>${data.message_source}</strong> | Messages: <strong>${data.message_count}</strong></div>
+                <div style="font-size: 0.85em; color: #888; margin-top: 4px;">Content: thinking=${cfg.include_thinking ? 'on' : 'off'} (${cfg.max_chars_thinking}), tool=${cfg.include_tool ? 'on' : 'off'} (${cfg.max_chars_tool}), text=${cfg.include_text ? 'on' : 'off'} (${cfg.max_chars_text})</div>
             `;
 
             document.getElementById('knowledge-debug-messages').innerHTML = data.messages.map(m => `
@@ -2742,7 +2830,6 @@ def index():
                 const cfg = data.config || {};
                 const defaults = data.defaults || {};
                 appConfig.summary_max_chars_total = parseInt(cfg.summary_max_chars_total || defaults.summary_max_chars_total || 8000);
-                appConfig.summary_max_chars_per_message = parseInt(cfg.summary_max_chars_per_message || defaults.summary_max_chars_per_message || 500);
                 appConfig.search_result_preview_length = parseInt(cfg.search_result_preview_length || defaults.search_result_preview_length || 500);
                 appConfig.dashboard_refresh_interval = parseInt(cfg.dashboard_refresh_interval || defaults.dashboard_refresh_interval || 5000);
                 console.log('App config loaded:', appConfig);

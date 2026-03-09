@@ -25,7 +25,6 @@ DEFAULT_CONFIG = {
     # 注入相关配置
     "inject_summary_count": "5",
     "inject_recent_count": "5",
-    "inject_preview_length": "200",
     "inject_knowledge_count": "5",
     "inject_task_count": "3",
     # 总结管理配置
@@ -36,9 +35,14 @@ DEFAULT_CONFIG = {
     "knowledge_condense_prompt": "",  # 空=使用默认模板
     # 总结生成配置
     "summary_max_chars_total": "8000",
-    "summary_max_chars_per_message": "500",
+    # 内容处理配置（用于总结、知识提取、历史注入等）
+    "content_include_thinking": "false",
+    "content_include_tool": "true",
+    "content_include_text": "true",
+    "content_max_chars_thinking": "200",
+    "content_max_chars_tool": "300",
+    "content_max_chars_text": "500",
     # 知识提取配置
-    "knowledge_max_chars_per_message": "500",
     "knowledge_max_items_per_category": "10",
     "knowledge_auto_condense": "true",
     # 搜索结果配置
@@ -185,19 +189,10 @@ CONFIG_META = {
     "inject_recent_count": {
         "label": "注入近期对话数",
         "description": "启动时注入的近期原始消息数量",
-        "tooltip": "【sessionStart hook 专用】新会话启动时，自动注入跨所有 session 的最近 N 条原始消息到 system-reminder。这是启动时的一次性快照，让 Claude 快速了解最近聊了什么。与「短期记忆消息数」的区别：本配置用于会话启动时自动注入，跨所有 session；短期记忆用于 MCP 工具实时查询，限定单个 session。消息可能被 inject_preview_length 截断。影响模块：sessionStart hook",
+        "tooltip": "【sessionStart hook 专用】新会话启动时，自动注入跨所有 session 的最近 N 条原始消息到 system-reminder。这是启动时的一次性快照，让 Claude 快速了解最近聊了什么。与「短期记忆消息数」的区别：本配置用于会话启动时自动注入，跨所有 session；短期记忆用于 MCP 工具实时查询，限定单个 session。消息内容使用 Content 配置处理（content_include_* 和 content_max_chars_*）。影响模块：sessionStart hook",
         "type": "number",
         "min": 3,
         "max": 20,
-        "group": "Inject",
-    },
-    "inject_preview_length": {
-        "label": "注入消息截取长度",
-        "description": "注入时每条消息的最大字符数",
-        "tooltip": "注入近期对话时，每条消息最多显示多少字符。设为 0 表示不截取（显示完整内容）。较长的消息会被截断并添加 '...'。这只影响注入显示，不影响数据库存储。影响模块：sessionStart hook",
-        "type": "number",
-        "min": 0,
-        "max": 2000,
         "group": "Inject",
     },
     "inject_knowledge_count": {
@@ -249,25 +244,7 @@ CONFIG_META = {
         "max": 32000,
         "group": "Summary",
     },
-    "summary_max_chars_per_message": {
-        "label": "总结单条消息最大字符",
-        "description": "发送给 LLM 时每条消息的最大字符数",
-        "tooltip": "生成摘要时，每条消息最多保留多少字符。超过的部分会被截断。这是为了避免单条超长消息（如代码）占用过多 token。Dashboard 的 Summary Messages 弹窗会标注被截断的消息。",
-        "type": "number",
-        "min": 100,
-        "max": 2000,
-        "group": "Summary",
-    },
     # 知识提取配置
-    "knowledge_max_chars_per_message": {
-        "label": "知识提取消息最大字符",
-        "description": "提取知识时每条消息的最大字符数",
-        "tooltip": "调用 LLM 提取结构化知识时，每条消息最多保留多少字符。与总结类似，用于控制发送给 LLM 的内容量。",
-        "type": "number",
-        "min": 100,
-        "max": 2000,
-        "group": "Knowledge",
-    },
     "knowledge_max_items_per_category": {
         "label": "每类知识最大条目数",
         "description": "每个知识类别的条目数上限",
@@ -284,6 +261,58 @@ CONFIG_META = {
         "type": "select",
         "options": ["true", "false"],
         "group": "Knowledge",
+    },
+    # 内容处理配置
+    "content_include_thinking": {
+        "label": "包含 Thinking",
+        "description": "是否在处理内容中包含 thinking 块",
+        "tooltip": "控制总结、知识提取、历史注入时是否包含 AI 的 thinking（思考过程）内容。thinking 通常较长且冗余，建议关闭以节省 token。",
+        "type": "select",
+        "options": ["true", "false"],
+        "group": "Content",
+    },
+    "content_include_tool": {
+        "label": "包含 Tool",
+        "description": "是否在处理内容中包含 tool 块",
+        "tooltip": "控制总结、知识提取、历史注入时是否包含工具调用信息。tool 块包含文件读写、搜索等操作，建议开启以保留关键操作记录。",
+        "type": "select",
+        "options": ["true", "false"],
+        "group": "Content",
+    },
+    "content_include_text": {
+        "label": "包含 Text",
+        "description": "是否在处理内容中包含 text 块",
+        "tooltip": "控制总结、知识提取、历史注入时是否包含纯文本内容。text 是 AI 的主要回复内容，通常需要保留。",
+        "type": "select",
+        "options": ["true", "false"],
+        "group": "Content",
+    },
+    "content_max_chars_thinking": {
+        "label": "Thinking 最大字符",
+        "description": "每条消息中 thinking 块的最大字符数",
+        "tooltip": "thinking 块的截断长度。thinking 通常很长，设置较小值可以节省 token 同时保留关键思路。设为 0 表示不截断。",
+        "type": "number",
+        "min": 0,
+        "max": 2000,
+        "group": "Content",
+    },
+    "content_max_chars_tool": {
+        "label": "Tool 最大字符",
+        "description": "每条消息中 tool 块的最大字符数",
+        "tooltip": "tool 块的截断长度。tool 块包含工具名称和参数，过长时会被截断。设为 0 表示不截断。",
+        "type": "number",
+        "min": 0,
+        "max": 2000,
+        "group": "Content",
+    },
+    "content_max_chars_text": {
+        "label": "Text 最大字符",
+        "description": "每条消息中 text 块的最大字符数",
+        "tooltip": "text 块的截断长度。text 是主要回复内容，建议设置较大值。设为 0 表示不截断。",
+        "type": "number",
+        "min": 0,
+        "max": 2000,
+        "group": "Content",
     },
     # 搜索结果配置
     "search_result_preview_length": {
@@ -366,10 +395,15 @@ class ConfigManager:
             "enable_knowledge_extraction": self.get("enable_knowledge_extraction").lower() == "true",
             # 总结配置
             "summary_max_chars_total": self.get_int("summary_max_chars_total"),
-            "summary_max_chars_per_message": self.get_int("summary_max_chars_per_message"),
             # 知识提取配置
-            "knowledge_max_chars_per_message": self.get_int("knowledge_max_chars_per_message"),
             "knowledge_max_items_per_category": self.get_int("knowledge_max_items_per_category"),
+            # 内容处理配置
+            "content_include_thinking": self.get("content_include_thinking").lower() == "true",
+            "content_include_tool": self.get("content_include_tool").lower() == "true",
+            "content_include_text": self.get("content_include_text").lower() == "true",
+            "content_max_chars_thinking": self.get_int("content_max_chars_thinking"),
+            "content_max_chars_tool": self.get_int("content_max_chars_tool"),
+            "content_max_chars_text": self.get_int("content_max_chars_text"),
             # Prompt 模板
             "summary_prompt_template": self.get("summary_prompt_template"),
             "knowledge_extraction_prompt": self.get("knowledge_extraction_prompt"),

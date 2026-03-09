@@ -10,6 +10,9 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 from src.memory_core import MemoryManager
 
+# 搜索结果预览截断长度
+SEARCH_PREVIEW_LENGTH = 300
+
 DB_PATH = os.environ.get("HYBRID_MEMORY_DB", None)
 
 server = Server("hybrid-memory")
@@ -116,7 +119,7 @@ async def call_tool(name: str, arguments: dict):
         results = manager.search_memory(
             arguments["query"], arguments.get("session_id")
         )
-        lines = [f"[{m.session_id}] {m.role}: {m.content[:200]}" for m in results[:10]]
+        lines = [f"[{m.session_id}] {m.role}: {m.content[:SEARCH_PREVIEW_LENGTH]}" for m in results[:10]]
         logger.info(f"Search completed via MCP: {len(results)} results")
         return [TextContent(type="text", text="\n".join(lines) or "No results found")]
 

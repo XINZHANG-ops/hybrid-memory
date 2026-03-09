@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from loguru import logger
-from src.memory_core import MemoryManager, publish_event
+from src.memory_core import MemoryManager, publish_event, ContentConfig, process_content
 from src.memory_core.config import load_config
 
 # 路径配置
@@ -169,10 +169,9 @@ def main():
         # 读取注入相关配置
         inject_summary_count = config_mgr.get_int("inject_summary_count")
         inject_recent_count = config_mgr.get_int("inject_recent_count")
-        inject_preview_length = config_mgr.get_int("inject_preview_length")
         inject_knowledge_count = config_mgr.get_int("inject_knowledge_count")
         inject_task_count = config_mgr.get_int("inject_task_count")
-        logger.info(f"Inject config: summaries={inject_summary_count}, recent={inject_recent_count}, preview_len={inject_preview_length}")
+        logger.info(f"Inject config: summaries={inject_summary_count}, recent={inject_recent_count}")
 
         # 1. 加载项目级记忆（跨会话）
         project_db = get_project_db_path(project_name)
@@ -221,11 +220,22 @@ def main():
             if project_context["summaries"]:
                 output_parts.append(f"# [{project_name}] 项目历史摘要:\n{project_context['summaries']}")
             if project_context["messages"]:
-                def truncate(text, max_len):
-                    if max_len <= 0 or len(text) <= max_len:
-                        return text
-                    return text[:max_len] + "..."
-                recent = "\n".join(f"- {m['role']}: {truncate(m['content'], inject_preview_length)}" for m in project_context["messages"])
+                # 使用 content_processor 处理消息内容
+                content_config = ContentConfig(
+                    include_thinking=config_mgr.get("content_include_thinking").lower() == "true",
+                    include_tool=config_mgr.get("content_include_tool").lower() == "true",
+                    include_text=config_mgr.get("content_include_text").lower() == "true",
+                    max_chars_thinking=config_mgr.get_int("content_max_chars_thinking"),
+                    max_chars_tool=config_mgr.get_int("content_max_chars_tool"),
+                    max_chars_text=config_mgr.get_int("content_max_chars_text"),
+                )
+                formatted_messages = []
+                for m in project_context["messages"]:
+                    processed = process_content(m['content'], content_config)
+                    if not processed:
+                        continue  # 用户关闭了所有类型，跳过此消息
+                    formatted_messages.append(f"- {m['role']}: {processed}")
+                recent = "\n".join(formatted_messages)
                 output_parts.append(f"# [{project_name}] 最近对话:\n{recent}")
 
         # 2. 加载结构化知识（所有会话，全部 6 类）
