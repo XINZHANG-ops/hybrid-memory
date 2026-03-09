@@ -41,7 +41,9 @@
       "Bash(sqlite3:*)",
       "Bash(chcp:*)",
       "Bash(ollama list:*)",
-      "Bash(del:*)"
+      "Bash(del:*)",
+      "Bash(D:pythonhybrid-memory.venvScriptspip install numpy)",
+      "Bash(.venv/Scripts/pip install:*)"
     ]
   }
 }

@@ -99,19 +99,27 @@ def start_dashboard_if_not_running():
         # Dashboard 没运行，启动它
         dashboard_script = MEMORY_BASE.parent / "src" / "http_api" / "dashboard.py"
         if dashboard_script.exists():
-            # 优先使用 venv 中的 python
+            # 优先使用 venv 中的 python，否则用系统 python 命令
             if sys.platform == "win32":
                 venv_python = MEMORY_BASE.parent / ".venv" / "Scripts" / "python.exe"
             else:
                 venv_python = MEMORY_BASE.parent / ".venv" / "bin" / "python"
-            python_cmd = str(venv_python) if venv_python.exists() else sys.executable
+
+            if venv_python.exists():
+                python_cmd = str(venv_python)
+            else:
+                # 没有 venv，使用系统 python 命令（依赖 PATH）
+                python_cmd = "python"
+
+            logger.debug(f"Starting dashboard with: {python_cmd}")
 
             creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             proc = subprocess.Popen(
                 [python_cmd, str(dashboard_script)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                creationflags=creationflags
+                creationflags=creationflags,
+                cwd=str(MEMORY_BASE.parent)  # 设置工作目录
             )
             # 保存 PID
             pid_file.write_text(str(proc.pid))
