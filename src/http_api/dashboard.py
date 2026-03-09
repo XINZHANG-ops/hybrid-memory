@@ -24,7 +24,7 @@ logger.remove()
 logger.add(
     LOG_FILE,
     rotation="10 MB",
-    retention="7 days",
+    retention="1 hour",
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
     level="DEBUG",
     encoding="utf-8",
@@ -668,7 +668,7 @@ def extract_knowledge(project_name):
 @app.route("/api/projects/<project_name>/knowledge-debug")
 def get_knowledge_debug(project_name):
     """获取知识提取的 prompt 和输入数据（用于调试）"""
-    from src.memory_core.knowledge_extractor import EXTRACTION_PROMPT
+    from src.memory_core.prompts import EXTRACTION_PROMPT
     from src.memory_core.config import load_config
     db_path = PROJECTS_DIR / f"{project_name}.db"
     if not db_path.exists():
@@ -729,7 +729,7 @@ def get_knowledge_debug(project_name):
 @app.route("/api/projects/<project_name>/summary-debug")
 def get_summary_debug(project_name):
     """获取即将发送给 summary 模型的内容（用于调试）- 与实际 summarizer 逻辑完全一致"""
-    from src.memory_core.summarizer import SUMMARY_PROMPT, SUMMARY_PROMPT_WITH_CONTEXT
+    from src.memory_core.prompts import SUMMARY_PROMPT, SUMMARY_PROMPT_WITH_CONTEXT
     from src.memory_core.config import load_config
     db_path = PROJECTS_DIR / f"{project_name}.db"
     if not db_path.exists():

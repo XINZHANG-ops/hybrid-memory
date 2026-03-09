@@ -1,45 +1,11 @@
 from loguru import logger
 from .models import Message
 from .llm_client import LLMClient
+from .prompts import SUMMARY_PROMPT, SUMMARY_PROMPT_WITH_CONTEXT, ROLE_LABELS
 
 # 默认值（可通过配置覆盖）
 DEFAULT_MAX_CHARS_TOTAL = 8000
 DEFAULT_MAX_CHARS_PER_MESSAGE = 500
-
-SUMMARY_PROMPT_WITH_CONTEXT = """# 任务：总结对话
-
-你是一个总结助手，不是对话参与者。不要继续对话，只需要输出总结。
-
-## 历史背景
-{previous_context}
-
-## 需要总结的对话
-{conversation}
-
-## 输出要求
-直接输出总结文本（不要输出"助手:"或任何角色标签），包括：
-1. 主要话题
-2. 重要决定
-3. 待办事项
-4. 关键上下文
-
-用简洁中文，不超过500字。"""
-
-SUMMARY_PROMPT = """# 任务：总结对话
-
-你是一个总结助手，不是对话参与者。不要继续对话，只需要输出总结。
-
-## 需要总结的对话
-{conversation}
-
-## 输出要求
-直接输出总结文本（不要输出"助手:"或任何角色标签），包括：
-1. 主要话题
-2. 重要决定
-3. 待办事项
-4. 关键上下文
-
-用简洁中文，不超过500字。"""
 
 
 class SummaryGenerator:
@@ -103,9 +69,7 @@ class SummaryGenerator:
         total_chars = 0
         # 优先保留最近的消息
         for msg in reversed(messages):
-            role_label = {"user": "用户", "assistant": "助手", "system": "系统"}.get(
-                msg.role, msg.role
-            )
+            role_label = ROLE_LABELS.get(msg.role, msg.role)
             # 每条消息最多 max_chars_per_message 字符
             content = msg.content[:max_chars_per_message] if len(msg.content) > max_chars_per_message else msg.content
             line = f"{role_label}: {content}"

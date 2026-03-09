@@ -27,7 +27,7 @@ MEMORY_BASE.mkdir(parents=True, exist_ok=True)
 # 移除默认的 stderr handler，只输出到文件
 logger.remove()
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
-logger.add(LOG_FILE, level="DEBUG", rotation="1 MB")
+logger.add(LOG_FILE, level="DEBUG", rotation="1 MB", retention="1 hour")
 
 
 def get_project_name() -> str:

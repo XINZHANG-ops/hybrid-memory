@@ -39,7 +39,7 @@ def publish_event(event_type: str, message: str, details: str = ""):
 
         # 写回文件
         with open(EVENTS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"events": events}, f, ensure_ascii=False)
+            json.dump({"events": events}, f, ensure_ascii=False, indent=2)
 
         logger.debug(f"Event published: [{event_type}] {message}")
     except Exception as e:

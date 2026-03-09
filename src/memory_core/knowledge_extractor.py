@@ -2,59 +2,10 @@ import json
 from loguru import logger
 from .models import Message
 from .llm_client import LLMClient
+from .prompts import EXTRACTION_PROMPT, CONDENSE_PROMPT, CATEGORY_NAMES, ROLE_LABELS
 
 # 默认值（可通过配置覆盖）
 DEFAULT_MAX_CHARS_PER_MESSAGE = 500
-
-
-CONDENSE_PROMPT = """你是一个知识精炼助手。以下是某个类别的知识条目列表，数量过多需要精炼。
-
-## 类别：{category_name}
-## 当前条目（{count}条）：
-{items}
-
-## 要求
-请将这些条目精炼为不超过 {max_count} 条，要求：
-1. 合并相似或重复的条目
-2. 保留最重要、最有价值的信息
-3. 删除过时或不再相关的内容
-4. 每条保持简洁明了
-
-请直接输出精炼后的条目列表（JSON数组格式），例如：
-["条目1", "条目2", "条目3"]
-
-只输出 JSON 数组，不要其他内容："""
-
-EXTRACTION_PROMPT = """你是一个知识提取助手。请从以下对话中提取**新的**结构化知识点。
-
-## 已有知识（不要重复这些）：
-{existing_knowledge}
-
-## 新对话内容：
-{conversation}
-
-## 请提取以下类型的**新**知识（JSON格式）：
-
-```json
-{{
-  "user_preferences": ["用户的偏好和习惯，如编码风格、沟通方式等"],
-  "project_decisions": ["项目中做出的重要技术决策和架构选择"],
-  "key_facts": ["需要记住的关键事实，如项目名、技术栈、用户名等"],
-  "pending_tasks": ["提到但未完成的任务或待办事项"],
-  "learned_patterns": ["观察到的用户行为模式或工作方式"],
-  "important_context": ["其他重要的上下文信息"]
-}}
-```
-
-注意：
-- **不要重复已有知识中的内容**，只提取新信息
-- 如果新对话修正或更新了已有知识，提取更新后的版本
-- 如果某个待办事项已完成，可以在 pending_tasks 中标注"[已完成] xxx"
-- 只提取确实存在的信息，没有的字段留空数组
-- 每个条目应该简洁明了
-- 用中文输出
-
-请输出 JSON（只输出 JSON，不要其他内容）："""
 
 
 class KnowledgeExtractor:
@@ -104,17 +55,9 @@ class KnowledgeExtractor:
         if not knowledge:
             return "(无已有知识)"
         lines = []
-        category_names = {
-            "user_preferences": "用户偏好",
-            "project_decisions": "项目决策",
-            "key_facts": "关键事实",
-            "pending_tasks": "待办事项",
-            "learned_patterns": "行为模式",
-            "important_context": "重要上下文",
-        }
         for key, items in knowledge.items():
             if items:
-                name = category_names.get(key, key)
+                name = CATEGORY_NAMES.get(key, key)
                 lines.append(f"- {name}: {', '.join(items[:10])}")  # 最多显示10条
         return "\n".join(lines) if lines else "(无已有知识)"
 
@@ -122,7 +65,7 @@ class KnowledgeExtractor:
         lines = []
         max_len = self.max_chars_per_message
         for msg in messages:
-            role_label = {"user": "用户", "assistant": "助手", "system": "系统"}.get(msg.role, msg.role)
+            role_label = ROLE_LABELS.get(msg.role, msg.role)
             content = msg.content[:max_len] if len(msg.content) > max_len else msg.content
             lines.append(f"{role_label}: {content}")
         return "\n".join(lines)
@@ -178,15 +121,6 @@ class KnowledgeExtractor:
 
     def condense_knowledge(self, knowledge: dict, max_per_category: int = 10) -> dict:
         """当知识条目过多时，使用 LLM 精炼每个类别"""
-        category_names = {
-            "user_preferences": "用户偏好",
-            "project_decisions": "项目决策",
-            "key_facts": "关键事实",
-            "pending_tasks": "待办事项",
-            "learned_patterns": "行为模式",
-            "important_context": "重要上下文",
-        }
-
         condensed = {}
         for key, items in knowledge.items():
             if len(items) <= max_per_category:
@@ -198,7 +132,7 @@ class KnowledgeExtractor:
             prompt_template = self.condense_prompt if self.condense_prompt and self.condense_prompt.strip() else CONDENSE_PROMPT
             try:
                 prompt = prompt_template.format(
-                    category_name=category_names.get(key, key),
+                    category_name=CATEGORY_NAMES.get(key, key),
                     count=len(items),
                     items="\n".join(f"- {item}" for item in items),
                     max_count=max_per_category,
@@ -206,7 +140,7 @@ class KnowledgeExtractor:
             except KeyError as e:
                 logger.warning(f"Custom condense prompt format error: {e}, falling back to default")
                 prompt = CONDENSE_PROMPT.format(
-                    category_name=category_names.get(key, key),
+                    category_name=CATEGORY_NAMES.get(key, key),
                     count=len(items),
                     items="\n".join(f"- {item}" for item in items),
                     max_count=max_per_category,
