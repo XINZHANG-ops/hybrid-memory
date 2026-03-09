@@ -74,8 +74,48 @@ def estimate_tokens(text: str) -> int:
     return int(chinese_chars / 1.5 + other_chars / 4)
 
 
-def extract_token_usage_from_transcript(transcript_path: str) -> dict:
-    """从 transcript 文件中提取 token 使用信息
+def get_processed_message_ids(db_path: Path) -> set:
+    """从数据库获取已处理过的 message_id 集合"""
+    try:
+        import sqlite3
+        if not db_path.exists():
+            return set()
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        # 检查表是否存在
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='processed_msg_ids'"
+        )
+        if not cursor.fetchone():
+            conn.execute("CREATE TABLE processed_msg_ids (msg_id TEXT PRIMARY KEY)")
+            conn.commit()
+            conn.close()
+            return set()
+        rows = conn.execute("SELECT msg_id FROM processed_msg_ids").fetchall()
+        conn.close()
+        return {row["msg_id"] for row in rows}
+    except Exception as e:
+        logger.error(f"Error getting processed message ids: {e}")
+        return set()
+
+
+def save_processed_message_ids(db_path: Path, msg_ids: set):
+    """保存已处理的 message_id 到数据库"""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        # 确保表存在
+        conn.execute("CREATE TABLE IF NOT EXISTS processed_msg_ids (msg_id TEXT PRIMARY KEY)")
+        for msg_id in msg_ids:
+            conn.execute("INSERT OR IGNORE INTO processed_msg_ids (msg_id) VALUES (?)", (msg_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error saving processed message ids: {e}")
+
+
+def extract_token_usage_from_transcript(transcript_path: str, project_db: Path) -> dict:
+    """从 transcript 文件中提取 token 使用信息（仅计算增量）
 
     Claude API 的 usage 字段包含：
     - input_tokens: 不包含缓存的新输入 token
@@ -86,10 +126,16 @@ def extract_token_usage_from_transcript(transcript_path: str) -> dict:
 
     Output tokens 由于 Claude Code transcript 格式限制无法准确获取，
     改用文本内容长度估算（包含 thinking、text、tool_use）。
+
+    重要：只计算未处理过的新消息，避免重复计数。
     """
     model = ""
     # 按消息 id 分组
     message_usage = {}  # {msg_id: {"input": ..., "output_text": "", "model": ...}}
+
+    # 获取已处理过的消息 ID
+    processed_ids = get_processed_message_ids(project_db)
+    new_msg_ids = set()
 
     try:
         path = Path(transcript_path)
@@ -115,6 +161,13 @@ def extract_token_usage_from_transcript(transcript_path: str) -> dict:
                         if not msg_id:
                             continue
 
+                        # 跳过已处理过的消息
+                        if msg_id in processed_ids:
+                            # 但仍然获取 model 信息
+                            if not model and msg_model:
+                                model = msg_model
+                            continue
+
                         usage = inner_msg.get("usage", {})
                         content = inner_msg.get("content", [])
 
@@ -130,6 +183,7 @@ def extract_token_usage_from_transcript(transcript_path: str) -> dict:
                                 "output_text": "",
                                 "model": msg_model
                             }
+                            new_msg_ids.add(msg_id)
 
                         # 收集所有输出内容用于估算
                         if isinstance(content, list):
@@ -151,12 +205,16 @@ def extract_token_usage_from_transcript(transcript_path: str) -> dict:
                 except json.JSONDecodeError:
                     continue
 
-        # 汇总所有消息的 token
+        # 保存新处理的消息 ID
+        if new_msg_ids:
+            save_processed_message_ids(project_db, new_msg_ids)
+
+        # 汇总新消息的 token（增量）
         total_input = sum(m["input"] for m in message_usage.values())
         # Output 使用估算
         total_output = sum(estimate_tokens(m["output_text"]) for m in message_usage.values())
 
-        logger.debug(f"Token usage from transcript: input={total_input}, output={total_output} (estimated), model={model}, msg_count={len(message_usage)}")
+        logger.debug(f"Token usage from transcript: input={total_input}, output={total_output} (estimated), model={model}, new_msgs={len(message_usage)}, skipped={len(processed_ids)}")
         return {"input_tokens": total_input, "output_tokens": total_output, "model": model}
     except Exception as e:
         logger.error(f"Error extracting token usage: {e}")
@@ -294,14 +352,17 @@ def main():
         logger.info(f"No last_assistant_message, extracting from transcript: {transcript_path}")
         response = extract_assistant_response_from_transcript(transcript_path)
 
-    # 提取 token 使用信息
-    token_usage_data = {"input_tokens": 0, "output_tokens": 0, "model": ""}
-    if transcript_path:
-        token_usage_data = extract_token_usage_from_transcript(transcript_path)
-        logger.info(f"Token usage: input={token_usage_data['input_tokens']}, output={token_usage_data['output_tokens']}")
-
     logger.info(f"Project: {project_name}, Session: {session_id}")
     logger.info(f"Stop reason: {stop_reason}, Response length: {len(response)}")
+
+    # 项目数据库路径（提前定义，用于 token 统计）
+    project_db = get_project_db_path(project_name)
+
+    # 提取 token 使用信息（传入 project_db 用于跟踪已处理的消息）
+    token_usage_data = {"input_tokens": 0, "output_tokens": 0, "model": ""}
+    if transcript_path:
+        token_usage_data = extract_token_usage_from_transcript(transcript_path, project_db)
+        logger.info(f"Token usage: input={token_usage_data['input_tokens']}, output={token_usage_data['output_tokens']}")
 
     try:
         # 从全局数据库加载配置
@@ -309,7 +370,6 @@ def main():
         config_kwargs = config_mgr.get_memory_manager_kwargs()
 
         # 项目级管理器
-        project_db = get_project_db_path(project_name)
         project_manager = MemoryManager(db_path=project_db, **config_kwargs)
 
         # 全局管理器
