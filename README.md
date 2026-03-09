@@ -36,12 +36,23 @@ Dashboard 会在 Claude Code 启动时自动运行（通过 SessionStart hook）
 
 当你修改了 Dashboard 或 API 代码后，需要手动重启才能看到变化：
 
+**Windows:**
 ```bash
-# 1. 杀掉所有 Python 进程
+# 杀掉 Dashboard 进程
 taskkill /F /IM python.exe
 
-# 2. 重启 Claude Code
-# Dashboard 会自动启动并加载新代码
+# 重启 Claude Code，Dashboard 会自动启动
+```
+
+**macOS/Linux:**
+```bash
+# 方法1: 杀掉占用 37888 端口的进程
+lsof -ti :37888 | xargs kill -9
+
+# 方法2: 杀掉所有 Python 进程（慎用）
+pkill -f python
+
+# 重启 Claude Code，Dashboard 会自动启动
 ```
 
 ## 目录结构

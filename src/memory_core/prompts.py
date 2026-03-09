@@ -211,6 +211,16 @@ _ROLE_LABELS_EN = {
     "system": "System",
 }
 
+# ============ UI Text ============
+
+_UI_TEXT_ZH = {
+    "no_existing_knowledge": "(无已有知识)",
+}
+
+_UI_TEXT_EN = {
+    "no_existing_knowledge": "(No existing knowledge)",
+}
+
 # ============ Prompt Data by Language ============
 
 _PROMPTS = {
@@ -221,6 +231,7 @@ _PROMPTS = {
         "condense": _CONDENSE_PROMPT_ZH,
         "category_names": _CATEGORY_NAMES_ZH,
         "role_labels": _ROLE_LABELS_ZH,
+        "ui_text": _UI_TEXT_ZH,
     },
     "en": {
         "summary_with_context": _SUMMARY_PROMPT_WITH_CONTEXT_EN,
@@ -229,6 +240,7 @@ _PROMPTS = {
         "condense": _CONDENSE_PROMPT_EN,
         "category_names": _CATEGORY_NAMES_EN,
         "role_labels": _ROLE_LABELS_EN,
+        "ui_text": _UI_TEXT_EN,
     },
 }
 
@@ -287,6 +299,10 @@ class _PromptAccessor:
     @property
     def ROLE_LABELS(self):
         return get_prompt("role_labels")
+
+    @property
+    def UI_TEXT(self):
+        return get_prompt("ui_text")
 
 
 _accessor = _PromptAccessor()

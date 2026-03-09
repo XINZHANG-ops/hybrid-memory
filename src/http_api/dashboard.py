@@ -685,32 +685,26 @@ def get_knowledge_debug(project_name):
         source = "recent_20"
 
     # 格式化对话（与 KnowledgeExtractor 一致）
+    from src.memory_core.prompts import ROLE_LABELS, CATEGORY_NAMES, UI_TEXT
     lines = []
     for msg in messages:
-        role_label = {"user": "用户", "assistant": "助手", "system": "系统"}.get(msg.role, msg.role)
+        role_label = ROLE_LABELS.get(msg.role, msg.role)
         content = msg.content[:max_chars] if len(msg.content) > max_chars else msg.content
         lines.append(f"{role_label}: {content}")
     conversation = "\n".join(lines)
 
     # 获取已有知识并格式化
     existing_knowledge = db.get_knowledge()
-    category_names = {
-        "user_preferences": "用户偏好",
-        "project_decisions": "项目决策",
-        "key_facts": "关键事实",
-        "pending_tasks": "待办事项",
-        "learned_patterns": "行为模式",
-        "important_context": "重要上下文",
-    }
+    no_knowledge_text = UI_TEXT.get("no_existing_knowledge", "(No existing knowledge)")
     if existing_knowledge:
         knowledge_lines = []
         for key, items in existing_knowledge.items():
             if items:
-                name = category_names.get(key, key)
+                name = CATEGORY_NAMES.get(key, key)
                 knowledge_lines.append(f"- {name}: {', '.join(items[:10])}")
-        existing_str = "\n".join(knowledge_lines) if knowledge_lines else "(无已有知识)"
+        existing_str = "\n".join(knowledge_lines) if knowledge_lines else no_knowledge_text
     else:
-        existing_str = "(无已有知识)"
+        existing_str = no_knowledge_text
 
     # 生成完整 prompt
     prompt = EXTRACTION_PROMPT.format(conversation=conversation, existing_knowledge=existing_str)
@@ -750,10 +744,11 @@ def get_summary_debug(project_name):
     previous_context = "\n\n---\n\n".join(s.summary_text for s in summaries) if summaries else ""
 
     # 格式化对话 - 与 summarizer._format_conversation 完全一致（使用配置参数）
+    from src.memory_core.prompts import ROLE_LABELS as SUMMARY_ROLE_LABELS
     lines = []
     total_chars = 0
     for msg in reversed(messages):
-        role_label = {"user": "用户", "assistant": "助手", "system": "系统"}.get(msg.role, msg.role)
+        role_label = SUMMARY_ROLE_LABELS.get(msg.role, msg.role)
         content = msg.content[:max_chars_per_message] if len(msg.content) > max_chars_per_message else msg.content
         line = f"{role_label}: {content}"
         if total_chars + len(line) > max_chars_total:
@@ -894,6 +889,11 @@ def get_config():
             "summary_prompt_template": get_prompt("summary_with_context"),
             "knowledge_extraction_prompt": get_prompt("extraction"),
             "knowledge_condense_prompt": get_prompt("condense"),
+        },
+        "i18n": {
+            "category_names": get_prompt("category_names"),
+            "role_labels": get_prompt("role_labels"),
+            "ui_text": get_prompt("ui_text"),
         }
     })
 
@@ -2051,24 +2051,14 @@ def index():
             // 显示累积知识（与 sessionStart.py 一致：全部 6 类）
             if (data.knowledge) {
                 const k = data.knowledge;
+                const catNames = (window.i18n && window.i18n.category_names) || {};
                 let knowledgeHtml = '';
-                if (k.user_preferences && k.user_preferences.length > 0) {
-                    knowledgeHtml += `<div style="margin: 5px 0;"><strong>用户偏好:</strong> ${escapeHtml(k.user_preferences.join(', '))}</div>`;
-                }
-                if (k.project_decisions && k.project_decisions.length > 0) {
-                    knowledgeHtml += `<div style="margin: 5px 0;"><strong>项目决策:</strong> ${escapeHtml(k.project_decisions.join(', '))}</div>`;
-                }
-                if (k.key_facts && k.key_facts.length > 0) {
-                    knowledgeHtml += `<div style="margin: 5px 0;"><strong>关键事实:</strong> ${escapeHtml(k.key_facts.join(', '))}</div>`;
-                }
-                if (k.pending_tasks && k.pending_tasks.length > 0) {
-                    knowledgeHtml += `<div style="margin: 5px 0;"><strong>待办事项:</strong> ${escapeHtml(k.pending_tasks.join(', '))}</div>`;
-                }
-                if (k.learned_patterns && k.learned_patterns.length > 0) {
-                    knowledgeHtml += `<div style="margin: 5px 0;"><strong>行为模式:</strong> ${escapeHtml(k.learned_patterns.join(', '))}</div>`;
-                }
-                if (k.important_context && k.important_context.length > 0) {
-                    knowledgeHtml += `<div style="margin: 5px 0;"><strong>重要上下文:</strong> ${escapeHtml(k.important_context.join(', '))}</div>`;
+                const categories = ['user_preferences', 'project_decisions', 'key_facts', 'pending_tasks', 'learned_patterns', 'important_context'];
+                for (const cat of categories) {
+                    if (k[cat] && k[cat].length > 0) {
+                        const label = catNames[cat] || cat;
+                        knowledgeHtml += `<div style="margin: 5px 0;"><strong>${escapeHtml(label)}:</strong> ${escapeHtml(k[cat].join(', '))}</div>`;
+                    }
                 }
                 if (knowledgeHtml) {
                     html += `<div class="context-section"><div class="context-label">Accumulated Knowledge:</div><div class="summary-text">${knowledgeHtml}</div></div>`;
@@ -2301,6 +2291,12 @@ def index():
             configDefaults = data.defaults || {};
             const config = data.config || {};
             const defaultPrompts = data.default_prompts || {};
+            // 存储 i18n 数据供全局使用
+            window.i18n = data.i18n || {
+                category_names: {},
+                role_labels: {},
+                ui_text: {}
+            };
 
             const groups = {
                 'Memory': {
@@ -2649,7 +2645,8 @@ def index():
                 </div>
             `).join('') || '<div style="color: #888;">No messages</div>';
 
-            document.getElementById('knowledge-debug-existing').textContent = data.existing_knowledge || '(无已有知识)';
+            const noKnowledgeText = (window.i18n && window.i18n.ui_text && window.i18n.ui_text.no_existing_knowledge) || '(No existing knowledge)';
+            document.getElementById('knowledge-debug-existing').textContent = data.existing_knowledge || noKnowledgeText;
             document.getElementById('knowledge-debug-prompt').textContent = data.full_prompt || 'No prompt';
             document.getElementById('knowledge-debug-panel').style.display = 'block';
         }

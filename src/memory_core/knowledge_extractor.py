@@ -2,7 +2,7 @@ import json
 from loguru import logger
 from .models import Message
 from .llm_client import LLMClient
-from .prompts import EXTRACTION_PROMPT, CONDENSE_PROMPT, CATEGORY_NAMES, ROLE_LABELS
+from .prompts import EXTRACTION_PROMPT, CONDENSE_PROMPT, CATEGORY_NAMES, ROLE_LABELS, UI_TEXT
 
 # 默认值（可通过配置覆盖）
 DEFAULT_MAX_CHARS_PER_MESSAGE = 500
@@ -52,14 +52,15 @@ class KnowledgeExtractor:
             return self._empty_knowledge()
 
     def _format_existing_knowledge(self, knowledge: dict | None) -> str:
+        no_knowledge_text = UI_TEXT.get("no_existing_knowledge", "(No existing knowledge)")
         if not knowledge:
-            return "(无已有知识)"
+            return no_knowledge_text
         lines = []
         for key, items in knowledge.items():
             if items:
                 name = CATEGORY_NAMES.get(key, key)
-                lines.append(f"- {name}: {', '.join(items[:10])}")  # 最多显示10条
-        return "\n".join(lines) if lines else "(无已有知识)"
+                lines.append(f"- {name}: {', '.join(items[:10])}")
+        return "\n".join(lines) if lines else no_knowledge_text
 
     def _format_conversation(self, messages: list[Message]) -> str:
         lines = []
