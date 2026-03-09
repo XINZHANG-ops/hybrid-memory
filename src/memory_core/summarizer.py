@@ -1,5 +1,5 @@
 from loguru import logger
-from .models import Message
+from .models import Message, Interaction
 from .llm_client import LLMClient
 from .prompts import SUMMARY_PROMPT, SUMMARY_PROMPT_WITH_CONTEXT, ROLE_LABELS
 
@@ -20,12 +20,12 @@ class SummaryGenerator:
         self.max_chars_per_message = max_chars_per_message
         logger.info(f"SummaryGenerator initialized (max_total={max_chars_total}, max_per_msg={max_chars_per_message})")
 
-    def generate(self, messages: list[Message], previous_context: str = "", custom_template: str = "") -> str:
+    def generate(self, messages: list[Message], previous_context: str = "", custom_template: str = "", interactions: list[Interaction] | None = None) -> str:
         if not messages:
             logger.debug("No messages to summarize")
             return ""
-        logger.info(f"Generating summary for {len(messages)} messages (with context: {len(previous_context)} chars)")
-        conversation = self._format_conversation(messages, self.max_chars_total, self.max_chars_per_message)
+        logger.info(f"Generating summary for {len(messages)} messages (with context: {len(previous_context)} chars, interactions: {len(interactions) if interactions else 0})")
+        conversation = self._format_conversation(messages, self.max_chars_total, self.max_chars_per_message, interactions)
         logger.debug(f"Formatted conversation length: {len(conversation)} chars")
 
         if custom_template and custom_template.strip():
@@ -62,20 +62,48 @@ class SummaryGenerator:
         messages: list[Message],
         max_chars_total: int = DEFAULT_MAX_CHARS_TOTAL,
         max_chars_per_message: int = DEFAULT_MAX_CHARS_PER_MESSAGE,
+        interactions: list[Interaction] | None = None,
     ) -> str:
         """格式化对话内容，限制总长度避免 prompt 过长"""
         logger.debug(f"Formatting {len(messages)} messages for summary (max_total={max_chars_total}, max_per_msg={max_chars_per_message})")
         lines = []
         total_chars = 0
+
+        # 建立消息时间戳索引，用于关联 interactions
+        msg_timestamps = [(msg.timestamp, msg) for msg in messages]
+
         # 优先保留最近的消息
-        for msg in reversed(messages):
+        for i, msg in enumerate(reversed(messages)):
             role_label = ROLE_LABELS.get(msg.role, msg.role)
             # 每条消息最多 max_chars_per_message 字符
             content = msg.content[:max_chars_per_message] if len(msg.content) > max_chars_per_message else msg.content
-            line = f"{role_label}: {content}"
+
+            # 为助手消息附加关联的 interactions
+            interaction_text = ""
+            if interactions and msg.role == "assistant":
+                # 找到在当前消息时间戳之前、上一条消息之后的 interactions
+                prev_timestamp = msg_timestamps[len(messages) - i - 2][0] if i < len(messages) - 1 else None
+                related = self._get_interactions_for_message(interactions, msg.timestamp, prev_timestamp)
+                if related:
+                    int_lines = []
+                    for intr in related:
+                        response_label = "批准" if intr.user_response == "yes" else ("拒绝" if intr.user_response == "no" else intr.user_response)
+                        int_lines.append(f"  [{intr.type}] {intr.tool_name}: {response_label}")
+                    interaction_text = "\n" + "\n".join(int_lines)
+
+            line = f"{role_label}: {content}{interaction_text}"
             if total_chars + len(line) > max_chars_total:
                 break
             lines.insert(0, line)
             total_chars += len(line)
         logger.debug(f"Formatted {len(lines)} messages, total {total_chars} chars")
         return "\n".join(lines)
+
+    def _get_interactions_for_message(self, interactions: list[Interaction], msg_timestamp, prev_timestamp) -> list[Interaction]:
+        """获取在消息时间戳之前、上一条消息之后的 interactions"""
+        result = []
+        for intr in interactions:
+            if intr.timestamp <= msg_timestamp:
+                if prev_timestamp is None or intr.timestamp > prev_timestamp:
+                    result.append(intr)
+        return result

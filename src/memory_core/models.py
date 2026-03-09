@@ -45,3 +45,15 @@ class TokenUsage:
     output_tokens: int
     model: str = ""
     timestamp: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class Interaction:
+    id: int | None
+    session_id: str
+    type: str  # permission_request, user_choice
+    tool_name: str = ""
+    request_content: str = ""
+    options: str = ""  # JSON array for AskUserQuestion options
+    user_response: str = ""
+    timestamp: datetime = field(default_factory=datetime.now)

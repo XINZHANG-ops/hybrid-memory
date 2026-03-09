@@ -198,6 +198,35 @@ def get_summaries(project_name):
     })
 
 
+@app.route("/api/projects/<project_name>/interactions")
+def get_interactions(project_name):
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+    session_id = request.args.get("session_id")
+    limit = int(request.args.get("limit", 100))
+    db = Database(db_path)
+    with db._connect() as conn:
+        if session_id:
+            rows = conn.execute(
+                """SELECT id, session_id, type, tool_name, request_content, options, user_response, timestamp
+                   FROM interactions WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?""",
+                (session_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT id, session_id, type, tool_name, request_content, options, user_response, timestamp
+                   FROM interactions ORDER BY timestamp DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+    return json_response({
+        "interactions": [{
+            "id": r[0], "session_id": r[1], "type": r[2], "tool_name": r[3],
+            "request_content": r[4], "options": r[5], "user_response": r[6], "timestamp": str(r[7])
+        } for r in rows]
+    })
+
+
 @app.route("/api/projects/<project_name>/summaries/<int:summary_id>", methods=["PUT"])
 def update_summary(project_name, summary_id):
     db_path = PROJECTS_DIR / f"{project_name}.db"
@@ -1437,6 +1466,8 @@ def index():
         let currentPanel = 'overview';
         let currentSession = '';
         let sessionsData = [];
+        let interactionsData = [];  // 存储权限请求和用户选择等交互记录
+        let expandedInteractions = new Set();  // 记录已展开的交互面板 ID
         // 全局配置（从后端加载）
         let appConfig = {
             summary_max_chars_total: 8000,
@@ -1661,12 +1692,71 @@ def index():
             return model;
         }
 
-        function renderAssistantMessage(m) {
+        function getInteractionsForMessage(msgTimestamp, prevMsgTimestamp) {
+            // 找到在当前消息时间戳之前、上一条消息之后的 interactions
+            const msgTime = new Date(msgTimestamp).getTime();
+            const prevTime = prevMsgTimestamp ? new Date(prevMsgTimestamp).getTime() : 0;
+            return interactionsData.filter(i => {
+                const iTime = new Date(i.timestamp).getTime();
+                return iTime <= msgTime && iTime > prevTime;
+            });
+        }
+
+        function toggleInteractionPanel(id) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (el.style.display === 'none') {
+                el.style.display = 'block';
+                expandedInteractions.add(id);
+            } else {
+                el.style.display = 'none';
+                expandedInteractions.delete(id);
+            }
+        }
+
+        function renderInteractions(interactions, msgId) {
+            if (!interactions || interactions.length === 0) return '';
+            const summary = interactions.map(i => {
+                const icon = i.type === 'permission_request' ? '🔐' : '❓';
+                const response = i.user_response === 'yes' ? '✓' : (i.user_response === 'no' ? '✗' : i.user_response);
+                return `${icon} ${i.tool_name}: ${response}`;
+            }).join(' | ');
+
+            let detailHtml = interactions.map(i => {
+                const icon = i.type === 'permission_request' ? '🔐' : '❓';
+                const typeLabel = i.type === 'permission_request' ? 'Permission' : 'Choice';
+                const responseColor = i.user_response === 'yes' ? '#4ade80' : (i.user_response === 'no' ? '#f87171' : '#fbbf24');
+                const content = i.request_content.length > 100 ? i.request_content.substring(0, 100) + '...' : i.request_content;
+                return `<div style="padding: 4px 0; border-bottom: 1px solid #333;">
+                    <span style="color: #888;">${icon} ${typeLabel}</span>
+                    <span style="color: #d9a04a; margin-left: 8px;">${escapeHtml(i.tool_name)}</span>
+                    <span style="color: ${responseColor}; margin-left: 8px; font-weight: bold;">${escapeHtml(i.user_response)}</span>
+                    <div style="color: #777; font-size: 0.85em; margin-top: 2px; font-family: monospace;">${escapeHtml(content)}</div>
+                </div>`;
+            }).join('');
+
+            // 使用稳定的 ID（基于消息 ID）
+            const id = 'int-msg-' + msgId;
+            const isExpanded = expandedInteractions.has(id);
+            return `<div style="background: #1a1a2e; border-radius: 6px; padding: 6px 10px; margin-bottom: 8px; border-left: 3px solid #9333ea; font-size: 0.85em;">
+                <div style="cursor: pointer; color: #a78bfa;" onclick="toggleInteractionPanel('${id}')">
+                    ⚡ ${interactions.length} interaction${interactions.length > 1 ? 's' : ''}: ${summary.length > 60 ? summary.substring(0, 60) + '...' : summary}
+                </div>
+                <div id="${id}" style="display: ${isExpanded ? 'block' : 'none'}; margin-top: 6px;">${detailHtml}</div>
+            </div>`;
+        }
+
+        function renderAssistantMessage(m, prevTimestamp) {
             const parts = parseAssistantContent(m.content);
             const modelLabel = formatModelName(m.model);
+            const interactions = getInteractionsForMessage(m.timestamp, prevTimestamp);
+
             let html = `<div style="display: flex; justify-content: flex-start; margin-bottom: 20px;">
                 <div style="max-width: 85%; width: 100%;">
                     <div style="font-size: 0.75em; color: #e94560; margin-bottom: 8px; font-weight: bold;">${modelLabel} <span style="color: #666; font-weight: normal;">#${m.id}</span></div>`;
+
+            // 先显示 interactions（在消息内容之前）
+            html += renderInteractions(interactions, m.id);
 
             for (const part of parts) {
                 if (part.type === 'thinking') {
@@ -1697,12 +1787,18 @@ def index():
 
         async function loadMessages() {
             if (!currentProject) return;
-            const url = currentSession ? `/api/projects/${currentProject}/messages?session_id=${encodeURIComponent(currentSession)}` : `/api/projects/${currentProject}/messages`;
-            const res = await fetch(url);
-            const data = await res.json();
-            const messages = [...(data.messages || [])].reverse();
+            const msgUrl = currentSession ? `/api/projects/${currentProject}/messages?session_id=${encodeURIComponent(currentSession)}` : `/api/projects/${currentProject}/messages`;
+            const intUrl = currentSession ? `/api/projects/${currentProject}/interactions?session_id=${encodeURIComponent(currentSession)}` : `/api/projects/${currentProject}/interactions`;
+
+            const [msgRes, intRes] = await Promise.all([fetch(msgUrl), fetch(intUrl)]);
+            const msgData = await msgRes.json();
+            const intData = await intRes.json();
+
+            const messages = [...(msgData.messages || [])].reverse();
+            interactionsData = intData.interactions || [];
             const listEl = document.getElementById('message-list');
-            listEl.innerHTML = messages.map(m => {
+            listEl.innerHTML = messages.map((m, idx) => {
+                const prevTimestamp = idx > 0 ? messages[idx - 1].timestamp : null;
                 if (m.role === 'user') {
                     return `
                     <div style="display: flex; justify-content: flex-end; margin-bottom: 20px;">
@@ -1713,7 +1809,7 @@ def index():
                         </div>
                     </div>`;
                 } else {
-                    return renderAssistantMessage(m);
+                    return renderAssistantMessage(m, prevTimestamp);
                 }
             }).join('') || '<p style="color: #888; text-align: center; padding: 40px;">No messages found</p>';
 
@@ -2547,20 +2643,7 @@ def index():
             let data = await res.json();
             document.getElementById('knowledge-status').textContent = '';
 
-            // 自动精炼：如果启用且需要精炼
-            if (data.auto_condense && data.needs_condense) {
-                const condenseBtn = document.getElementById('condense-btn');
-                if (condenseBtn) {
-                    condenseBtn.disabled = true;
-                    condenseBtn.textContent = 'Condensing...';
-                }
-                const condenseRes = await fetch(`/api/projects/${currentProject}/knowledge/condense`, {method: 'POST'});
-                data = await condenseRes.json();
-                if (condenseBtn) {
-                    condenseBtn.disabled = false;
-                    condenseBtn.textContent = 'Condense Knowledge';
-                }
-            }
+            // 不再在加载时自动 condense - condense 只在提取后超限时自动触发，或手动点击
 
             const k = data.knowledge || {};
             const maxPerCategory = data.max_per_category || 10;

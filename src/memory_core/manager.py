@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 from loguru import logger
 from .database import Database
@@ -37,6 +38,7 @@ class MemoryManager:
         summary_max_chars_per_message: int = 500,
         # 知识提取配置
         knowledge_max_chars_per_message: int = 500,
+        knowledge_max_items_per_category: int = 10,
         # Prompt 模板
         summary_prompt_template: str = "",
         knowledge_extraction_prompt: str = "",
@@ -97,6 +99,7 @@ class MemoryManager:
 
         # 知识提取
         self.enable_knowledge_extraction = enable_knowledge_extraction
+        self.knowledge_max_items_per_category = knowledge_max_items_per_category
         self.knowledge_extractor = None
         if enable_knowledge_extraction:
             self.knowledge_extractor = KnowledgeExtractor(
@@ -115,8 +118,14 @@ class MemoryManager:
         # Resume 时也更新活动时间，确保时间显示为最新
         self.db.update_session_activity(session_id)
 
-    def add_message(self, session_id: str, role: str, content: str, model: str = "") -> Message:
-        logger.debug(f"MemoryManager.add_message: session={session_id}, role={role}, model={model}")
+    def add_message(self, session_id: str, role: str, content: str, model: str = "", auto_summarize: bool = True) -> Message:
+        """添加消息到会话
+
+        Args:
+            auto_summarize: 是否在达到阈值时自动触发总结。
+                           在 hook 中应设为 False，因为 hook 进程很快退出，后台线程会被终止。
+        """
+        logger.debug(f"MemoryManager.add_message: session={session_id}, role={role}, model={model}, auto_summarize={auto_summarize}")
         self.db.create_session(session_id)
         self.db.update_session_activity(session_id)
         message = self.short_term.add(session_id, role, content, model=model)
@@ -136,10 +145,28 @@ class MemoryManager:
                 logger.warning(f"Failed to index message: {e}")
                 publish_event("error", f"Embedding failed: {e}", "")
 
-        if self.long_term.should_summarize(session_id):
-            logger.info(f"Summary threshold reached for session {session_id}, triggering summarization")
-            self.trigger_summary(session_id)
+        if auto_summarize and self.long_term.should_summarize(session_id):
+            logger.info(f"Summary threshold reached for session {session_id}, triggering background summarization")
+            # 在后台线程中执行总结，避免阻塞调用者
+            thread = threading.Thread(
+                target=self._background_summary,
+                args=(session_id,),
+                daemon=True
+            )
+            thread.start()
+            logger.debug("Background summary thread started")
         return message
+
+    def _background_summary(self, session_id: str):
+        """在后台线程中执行总结和知识提取"""
+        try:
+            logger.info(f"[Background] Starting summary for session {session_id}")
+            self.trigger_summary(session_id)
+            logger.info(f"[Background] Summary completed for session {session_id}")
+        except Exception as e:
+            logger.error(f"[Background] Summary failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     def get_context(self, session_id: str, max_tokens: int | None = None) -> dict:
         logger.debug(f"MemoryManager.get_context: session={session_id}, max_tokens={max_tokens}")
@@ -183,6 +210,14 @@ class MemoryManager:
                 if new_knowledge:
                     # 合并新旧知识
                     merged = self.knowledge_extractor.merge_knowledge(existing_knowledge, new_knowledge)
+
+                    # 检查是否超过每类限制，超过则自动 condense
+                    needs_condense = any(len(items) > self.knowledge_max_items_per_category for items in merged.values())
+                    if needs_condense:
+                        logger.info(f"Knowledge exceeds limit ({self.knowledge_max_items_per_category}), condensing...")
+                        publish_event("knowledge", f"{source_tag} Condensing knowledge", "Over limit, calling LLM...")
+                        merged = self.knowledge_extractor.condense_knowledge(merged, self.knowledge_max_items_per_category)
+
                     self.db.save_knowledge(session_id, merged)
                     new_items = sum(len(v) for v in new_knowledge.values())
                     total_items = sum(len(v) for v in merged.values())

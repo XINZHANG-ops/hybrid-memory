@@ -369,6 +369,7 @@ class ConfigManager:
             "summary_max_chars_per_message": self.get_int("summary_max_chars_per_message"),
             # 知识提取配置
             "knowledge_max_chars_per_message": self.get_int("knowledge_max_chars_per_message"),
+            "knowledge_max_items_per_category": self.get_int("knowledge_max_items_per_category"),
             # Prompt 模板
             "summary_prompt_template": self.get("summary_prompt_template"),
             "knowledge_extraction_prompt": self.get("knowledge_extraction_prompt"),

@@ -137,6 +137,28 @@ def configure_hooks():
                 ]
             }
         ],
+        "PermissionRequest": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f'"{python_exe}" "{hooks_dir / "permissionRequest.py"}"',
+                        "timeout": 5000,
+                    }
+                ]
+            }
+        ],
+        "PostToolUse": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f'"{python_exe}" "{hooks_dir / "postToolUse.py"}"',
+                        "timeout": 5000,
+                    }
+                ]
+            }
+        ],
         "Stop": [
             {
                 "hooks": [

@@ -80,16 +80,16 @@ def main():
             config_mgr = load_config(GLOBAL_DB)
             config_kwargs = config_mgr.get_memory_manager_kwargs()
 
-            # 1. 保存到项目级数据库
+            # 1. 保存到项目级数据库（禁用自动总结，因为 hook 进程很快退出）
             project_db = get_project_db_path(project_name)
             project_manager = MemoryManager(db_path=project_db, **config_kwargs)
-            project_msg = project_manager.add_message(session_id, "user", prompt)
+            project_msg = project_manager.add_message(session_id, "user", prompt, auto_summarize=False)
             logger.info(f"[Project] User message saved: id={project_msg.id}")
 
-            # 2. 保存到全局数据库（带项目标记）
+            # 2. 保存到全局数据库（禁用自动总结）
             global_manager = MemoryManager(db_path=GLOBAL_DB, **config_kwargs)
             global_session_id = f"{project_name}:{session_id}"
-            global_msg = global_manager.add_message(global_session_id, "user", prompt)
+            global_msg = global_manager.add_message(global_session_id, "user", prompt, auto_summarize=False)
             logger.info(f"[Global] User message saved: id={global_msg.id}, session={global_session_id}")
 
         except Exception as e:

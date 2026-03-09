@@ -8,12 +8,13 @@ Stop Hook - 双层记忆系统
 import sys
 import json
 import os
+import subprocess
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from loguru import logger
-from src.memory_core import MemoryManager, TokenUsage, Database, publish_event
+from src.memory_core import MemoryManager, TokenUsage, Database, publish_event, Interaction
 from src.memory_core.config import load_config
 
 # 路径配置
@@ -112,6 +113,21 @@ def save_processed_message_ids(db_path: Path, msg_ids: set):
         conn.close()
     except Exception as e:
         logger.error(f"Error saving processed message ids: {e}")
+
+
+def finalize_pending_permissions(db: Database, session_id: str):
+    """将所有 pending 的权限请求标记为 no（用户未批准）"""
+    try:
+        with db._connect() as conn:
+            result = conn.execute(
+                """UPDATE interactions SET user_response = 'no'
+                   WHERE session_id = ? AND type = 'permission_request' AND user_response = 'pending'""",
+                (session_id,)
+            )
+            if result.rowcount > 0:
+                logger.info(f"Marked {result.rowcount} pending permission requests as 'no'")
+    except Exception as e:
+        logger.error(f"Error finalizing pending permissions: {e}")
 
 
 def extract_token_usage_from_transcript(transcript_path: str, project_db: Path) -> dict:
@@ -386,12 +402,12 @@ def main():
             model_name = token_usage_data.get("model", "")
             publish_event("message", f"Saving message ({len(response)} chars)", project_name)
 
-            # 1. 保存到项目级数据库
-            project_msg = project_manager.add_message(session_id, "assistant", response, model=model_name)
+            # 1. 保存到项目级数据库（禁用自动总结，因为 hook 进程很快退出）
+            project_msg = project_manager.add_message(session_id, "assistant", response, model=model_name, auto_summarize=False)
             logger.info(f"[Project] Assistant message saved: id={project_msg.id}, model={model_name}")
 
-            # 2. 保存到全局数据库
-            global_msg = global_manager.add_message(global_session_id, "assistant", response, model=model_name)
+            # 2. 保存到全局数据库（禁用自动总结）
+            global_msg = global_manager.add_message(global_session_id, "assistant", response, model=model_name, auto_summarize=False)
             logger.info(f"[Global] Assistant message saved: id={global_msg.id}, model={model_name}")
 
         else:
@@ -417,21 +433,48 @@ def main():
             global_db_obj.add_token_usage(usage)
             logger.info(f"Token usage saved: input={usage.input_tokens}, output={usage.output_tokens}")
 
-        # 处理会话结束（知识提取已在 trigger_summary 中自动完成）
+        # 4. 将所有 pending 的权限请求标记为 no
+        finalize_pending_permissions(Database(project_db), session_id)
+        finalize_pending_permissions(Database(GLOBAL_DB), global_session_id)
+
+        # 5. 检查是否需要触发后台总结（达到阈值时）
+        should_summarize = project_manager.long_term.should_summarize(session_id)
+        if should_summarize and stop_reason != "end_session":
+            logger.info("Summary threshold reached, starting background summary process")
+            publish_event("summary", f"Threshold reached, starting background summary", project_name)
+
+            background_script = Path(__file__).parent / "background_summary.py"
+            if background_script.exists():
+                cmd = [sys.executable, str(background_script), project_name, session_id, str(project_db), str(GLOBAL_DB), "--no-end-session"]
+                try:
+                    if sys.platform == "win32":
+                        subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
+                    else:
+                        subprocess.Popen(cmd, start_new_session=True)
+                    logger.info(f"Background summary process started")
+                except Exception as e:
+                    logger.error(f"Failed to start background summary process: {e}")
+
+        # 处理会话结束（在后台子进程执行，避免阻塞 hook）
         if stop_reason == "end_session":
-            logger.info("End session requested")
-            publish_event("session_end", f"Session ending: {project_name}", "Triggering summary & knowledge extraction")
+            logger.info("End session requested, starting background process")
+            publish_event("session_end", f"Session ending: {project_name}", "Starting background summary & knowledge extraction")
 
-            # 项目级会话结束（会自动触发总结和知识提取）
-            project_summary = project_manager.end_session(session_id)
-            if project_summary:
-                logger.info(f"[Project] Session ended with summary: id={project_summary.id}")
-                publish_event("summary_done", f"Summary created: #{project_summary.id}", project_name)
-
-            # 全局会话结束
-            global_summary = global_manager.end_session(global_session_id)
-            if global_summary:
-                logger.info(f"[Global] Session ended with summary: id={global_summary.id}")
+            background_script = Path(__file__).parent / "background_summary.py"
+            if background_script.exists():
+                # 使用与 hook 相同的 Python 解释器
+                cmd = [sys.executable, str(background_script), project_name, session_id, str(project_db), str(GLOBAL_DB)]
+                try:
+                    # 启动独立进程，不等待完成
+                    if sys.platform == "win32":
+                        subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
+                    else:
+                        subprocess.Popen(cmd, start_new_session=True)
+                    logger.info(f"Background summary process started: {' '.join(cmd)}")
+                except Exception as e:
+                    logger.error(f"Failed to start background process: {e}")
+            else:
+                logger.warning(f"Background script not found: {background_script}")
 
     except Exception as e:
         logger.error(f"Error: {e}")

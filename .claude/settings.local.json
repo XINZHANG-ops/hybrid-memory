@@ -43,7 +43,9 @@
       "Bash(ollama list:*)",
       "Bash(del:*)",
       "Bash(D:pythonhybrid-memory.venvScriptspip install numpy)",
-      "Bash(.venv/Scripts/pip install:*)"
+      "Bash(.venv/Scripts/pip install:*)",
+      "Bash(cmd /c \"del \\\\?\\\\D:\\\\python\\\\hybrid-memory\\\\nul\")",
+      "Bash(cmd //c \"del /f /q \"\"\\\\\\\\?\\\\D:\\\\python\\\\hybrid-memory\\\\nul\"\"\")"
     ]
   }
 }

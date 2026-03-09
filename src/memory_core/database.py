@@ -3,7 +3,7 @@ from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime
 from loguru import logger
-from .models import Message, Summary, Session, TokenUsage
+from .models import Message, Summary, Session, TokenUsage, Interaction
 
 DEFAULT_DB_PATH = Path(__file__).parent.parent.parent / "data" / "memory.db"
 
@@ -63,6 +63,18 @@ CREATE TABLE IF NOT EXISTS token_usage (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
+CREATE TABLE IF NOT EXISTS interactions (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    tool_name TEXT,
+    request_content TEXT,
+    options TEXT,
+    user_response TEXT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_session ON knowledge(session_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_category ON knowledge(category);
@@ -70,6 +82,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_summarized ON messages(is_summarized);
 CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id);
 CREATE INDEX IF NOT EXISTS idx_token_usage_session ON token_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
+CREATE INDEX IF NOT EXISTS idx_interactions_session ON interactions(session_id);
+CREATE INDEX IF NOT EXISTS idx_interactions_timestamp ON interactions(timestamp);
 """
 
 
@@ -511,5 +525,65 @@ class Database:
             input_tokens=row["input_tokens"],
             output_tokens=row["output_tokens"],
             model=row["model"] or "",
+            timestamp=row["timestamp"] if isinstance(row["timestamp"], datetime) else datetime.fromisoformat(row["timestamp"]),
+        )
+
+    def add_interaction(self, interaction: Interaction) -> Interaction:
+        logger.debug(f"Adding interaction: session={interaction.session_id}, type={interaction.type}, tool={interaction.tool_name}")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """INSERT INTO interactions (session_id, type, tool_name, request_content, options, user_response, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    interaction.session_id,
+                    interaction.type,
+                    interaction.tool_name,
+                    interaction.request_content,
+                    interaction.options,
+                    interaction.user_response,
+                    interaction.timestamp,
+                ),
+            )
+            interaction.id = cursor.lastrowid
+            logger.info(f"Interaction added: id={interaction.id}, type={interaction.type}, tool={interaction.tool_name}")
+            return interaction
+
+    def get_interactions(self, session_id: str, start_time: datetime | None = None, end_time: datetime | None = None) -> list[Interaction]:
+        logger.debug(f"Getting interactions: session={session_id}, start={start_time}, end={end_time}")
+        with self._connect() as conn:
+            query = "SELECT * FROM interactions WHERE session_id = ?"
+            params: list = [session_id]
+            if start_time:
+                query += " AND timestamp >= ?"
+                params.append(start_time)
+            if end_time:
+                query += " AND timestamp <= ?"
+                params.append(end_time)
+            query += " ORDER BY timestamp ASC"
+            rows = conn.execute(query, params).fetchall()
+            interactions = [self._row_to_interaction(row) for row in rows]
+            logger.debug(f"Retrieved {len(interactions)} interactions")
+            return interactions
+
+    def get_all_interactions(self, limit: int = 100) -> list[Interaction]:
+        logger.debug(f"Getting all interactions: limit={limit}")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM interactions ORDER BY timestamp DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            interactions = [self._row_to_interaction(row) for row in rows]
+            logger.debug(f"Retrieved {len(interactions)} interactions")
+            return interactions
+
+    def _row_to_interaction(self, row: sqlite3.Row) -> Interaction:
+        return Interaction(
+            id=row["id"],
+            session_id=row["session_id"],
+            type=row["type"],
+            tool_name=row["tool_name"] or "",
+            request_content=row["request_content"] or "",
+            options=row["options"] or "",
+            user_response=row["user_response"] or "",
             timestamp=row["timestamp"] if isinstance(row["timestamp"], datetime) else datetime.fromisoformat(row["timestamp"]),
         )

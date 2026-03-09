@@ -28,7 +28,12 @@ class LongTermMemory:
         logger.debug(f"Message range: id={messages[0].id} to id={messages[-1].id}")
         # 获取所有历史摘要作为上下文（跨 session）
         previous_summaries = self.get_all_summaries_text()
-        summary_text = self.summarizer.generate(messages, previous_context=previous_summaries)
+        # 获取相关时间范围内的 interactions
+        start_time = messages[0].timestamp if messages else None
+        end_time = messages[-1].timestamp if messages else None
+        interactions = self.db.get_interactions(session_id, start_time, end_time) if start_time and end_time else []
+        logger.debug(f"Found {len(interactions)} interactions for summary")
+        summary_text = self.summarizer.generate(messages, previous_context=previous_summaries, interactions=interactions)
         summary = Summary(
             id=None,
             session_id=session_id,
