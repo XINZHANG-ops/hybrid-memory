@@ -171,12 +171,12 @@ def extract_token_usage_from_transcript(transcript_path: str, project_db: Path) 
                         usage = inner_msg.get("usage", {})
                         content = inner_msg.get("content", [])
 
-                        # 初始化消息记录
+                        # 计算 input tokens（增量：只计算新增的，不含缓存读取）
                         if msg_id not in message_usage:
                             input_tokens = (
                                 usage.get("input_tokens", 0) +
-                                usage.get("cache_creation_input_tokens", 0) +
-                                usage.get("cache_read_input_tokens", 0)
+                                usage.get("cache_creation_input_tokens", 0)
+                                # 不计入 cache_read_input_tokens，因为那是重复读取的
                             ) if usage else 0
                             message_usage[msg_id] = {
                                 "input": input_tokens,
@@ -185,20 +185,22 @@ def extract_token_usage_from_transcript(transcript_path: str, project_db: Path) 
                             }
                             new_msg_ids.add(msg_id)
 
-                        # 收集所有输出内容用于估算
+                        # 收集输出内容（覆盖而非累加，因为流式输出最后一次是完整版）
+                        output_text = ""
                         if isinstance(content, list):
                             for part in content:
                                 if isinstance(part, dict):
                                     part_type = part.get("type", "")
                                     if part_type == "thinking":
-                                        message_usage[msg_id]["output_text"] += part.get("thinking", "")
+                                        output_text += part.get("thinking", "")
                                     elif part_type == "text":
-                                        message_usage[msg_id]["output_text"] += part.get("text", "")
+                                        output_text += part.get("text", "")
                                     elif part_type == "tool_use":
-                                        # 工具调用也计入 output
                                         tool_name = part.get("name", "")
                                         tool_input = json.dumps(part.get("input", {}), ensure_ascii=False)
-                                        message_usage[msg_id]["output_text"] += f"{tool_name}: {tool_input}"
+                                        output_text += f"{tool_name}: {tool_input}"
+                        # 用当前内容覆盖（流式输出，最后一次是完整版）
+                        message_usage[msg_id]["output_text"] = output_text
 
                         if not model and msg_model:
                             model = msg_model

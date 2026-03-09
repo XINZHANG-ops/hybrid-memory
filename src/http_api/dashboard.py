@@ -883,6 +883,7 @@ def stream_logs():
 
 @app.route("/api/config")
 def get_config():
+    from src.memory_core.prompts import get_prompt
     db = Database(GLOBAL_DB)
     config_mgr = ConfigManager(db)
     return json_response({
@@ -890,9 +891,9 @@ def get_config():
         "defaults": DEFAULT_CONFIG,
         "meta": CONFIG_META,
         "default_prompts": {
-            "summary_prompt_template": SUMMARY_PROMPT_WITH_CONTEXT,
-            "knowledge_extraction_prompt": EXTRACTION_PROMPT,
-            "knowledge_condense_prompt": CONDENSE_PROMPT,
+            "summary_prompt_template": get_prompt("summary_with_context"),
+            "knowledge_extraction_prompt": get_prompt("extraction"),
+            "knowledge_condense_prompt": get_prompt("condense"),
         }
     })
 
@@ -2340,7 +2341,7 @@ def index():
                 },
                 'Prompts': {
                     icon: '✏️',
-                    keys: ['summary_prompt_template', 'knowledge_extraction_prompt', 'knowledge_condense_prompt']
+                    keys: ['prompt_language', 'summary_prompt_template', 'knowledge_extraction_prompt', 'knowledge_condense_prompt']
                 }
             };
 
@@ -2359,7 +2360,9 @@ def index():
                 if (meta.type === 'select' && meta.options) {
                     itemHtml += `<select id="config-${key}" style="width: 100%; max-width: 400px; padding: 10px; background: #1a3a5c; color: #eee; border: 1px solid #333; border-radius: 5px;">`;
                     for (const opt of meta.options) {
-                        itemHtml += `<option value="${opt}" ${value === opt ? 'selected' : ''}>${opt}</option>`;
+                        const optValue = typeof opt === 'object' ? opt.value : opt;
+                        const optLabel = typeof opt === 'object' ? opt.label : opt;
+                        itemHtml += `<option value="${optValue}" ${value === optValue ? 'selected' : ''}>${optLabel}</option>`;
                     }
                     itemHtml += `</select>`;
                 } else if (meta.type === 'number') {
@@ -2406,7 +2409,7 @@ def index():
                 'summary_max_chars_total', 'summary_max_chars_per_message',
                 'knowledge_max_chars_per_message', 'knowledge_max_items_per_category', 'knowledge_auto_condense',
                 'search_result_preview_length', 'dashboard_refresh_interval',
-                'summary_prompt_template', 'knowledge_extraction_prompt', 'knowledge_condense_prompt'
+                'prompt_language', 'summary_prompt_template', 'knowledge_extraction_prompt', 'knowledge_condense_prompt'
             ];
             for (const key of configKeys) {
                 const el = document.getElementById(`config-${key}`);

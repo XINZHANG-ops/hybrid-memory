@@ -45,6 +45,8 @@ DEFAULT_CONFIG = {
     "search_result_preview_length": "500",
     # Dashboard 刷新配置
     "dashboard_refresh_interval": "5000",
+    # Prompt 语言配置
+    "prompt_language": "zh",
 }
 
 # 配置元数据（用于 UI 展示）
@@ -302,6 +304,18 @@ CONFIG_META = {
         "min": 0,
         "max": 60000,
         "group": "Dashboard",
+    },
+    # Prompt 语言配置
+    "prompt_language": {
+        "label": "Prompt 语言",
+        "description": "LLM prompt 使用的语言",
+        "tooltip": "控制系统生成 Summary 和 Knowledge 时使用的 prompt 语言。zh=中文，en=英文。修改后立即生效，无需重启服务。",
+        "type": "select",
+        "options": [
+            {"value": "zh", "label": "中文"},
+            {"value": "en", "label": "English"},
+        ],
+        "group": "Prompts",
     },
 }
 

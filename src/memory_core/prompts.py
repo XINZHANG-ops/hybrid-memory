@@ -1,11 +1,9 @@
 """
 统一 Prompt 管理模块
 所有 LLM prompt 模板集中定义在此
+支持从 config 动态读取语言设置
 """
-
-# ============ Language Selection ============
-# "zh" for Chinese, "en" for English
-LANGUAGE = "zh"
+from pathlib import Path
 
 # ============ Summary Prompts ============
 
@@ -213,19 +211,88 @@ _ROLE_LABELS_EN = {
     "system": "System",
 }
 
-# ============ Language Selection ============
+# ============ Prompt Data by Language ============
 
-if LANGUAGE == "zh":
-    SUMMARY_PROMPT_WITH_CONTEXT = _SUMMARY_PROMPT_WITH_CONTEXT_ZH
-    SUMMARY_PROMPT = _SUMMARY_PROMPT_ZH
-    EXTRACTION_PROMPT = _EXTRACTION_PROMPT_ZH
-    CONDENSE_PROMPT = _CONDENSE_PROMPT_ZH
-    CATEGORY_NAMES = _CATEGORY_NAMES_ZH
-    ROLE_LABELS = _ROLE_LABELS_ZH
-else:
-    SUMMARY_PROMPT_WITH_CONTEXT = _SUMMARY_PROMPT_WITH_CONTEXT_EN
-    SUMMARY_PROMPT = _SUMMARY_PROMPT_EN
-    EXTRACTION_PROMPT = _EXTRACTION_PROMPT_EN
-    CONDENSE_PROMPT = _CONDENSE_PROMPT_EN
-    CATEGORY_NAMES = _CATEGORY_NAMES_EN
-    ROLE_LABELS = _ROLE_LABELS_EN
+_PROMPTS = {
+    "zh": {
+        "summary_with_context": _SUMMARY_PROMPT_WITH_CONTEXT_ZH,
+        "summary": _SUMMARY_PROMPT_ZH,
+        "extraction": _EXTRACTION_PROMPT_ZH,
+        "condense": _CONDENSE_PROMPT_ZH,
+        "category_names": _CATEGORY_NAMES_ZH,
+        "role_labels": _ROLE_LABELS_ZH,
+    },
+    "en": {
+        "summary_with_context": _SUMMARY_PROMPT_WITH_CONTEXT_EN,
+        "summary": _SUMMARY_PROMPT_EN,
+        "extraction": _EXTRACTION_PROMPT_EN,
+        "condense": _CONDENSE_PROMPT_EN,
+        "category_names": _CATEGORY_NAMES_EN,
+        "role_labels": _ROLE_LABELS_EN,
+    },
+}
+
+# ============ Global DB Path ============
+_GLOBAL_DB_PATH = Path(__file__).parent.parent.parent / "data" / "global_memory.db"
+
+
+def _get_language() -> str:
+    """从 config 动态获取语言设置"""
+    try:
+        import sqlite3
+        if not _GLOBAL_DB_PATH.exists():
+            return "zh"
+        conn = sqlite3.connect(_GLOBAL_DB_PATH)
+        cursor = conn.execute("SELECT value FROM config WHERE key = 'prompt_language'")
+        row = cursor.fetchone()
+        conn.close()
+        if row and row[0] in ("zh", "en"):
+            return row[0]
+    except Exception:
+        pass
+    return "zh"
+
+
+def get_prompt(key: str) -> str | dict:
+    """获取指定 key 的 prompt（根据当前语言设置）"""
+    lang = _get_language()
+    return _PROMPTS.get(lang, _PROMPTS["zh"]).get(key, "")
+
+
+# ============ 兼容旧代码的属性访问 ============
+
+class _PromptAccessor:
+    """动态属性访问器，支持 prompts.SUMMARY_PROMPT 这样的旧式访问"""
+
+    @property
+    def SUMMARY_PROMPT_WITH_CONTEXT(self):
+        return get_prompt("summary_with_context")
+
+    @property
+    def SUMMARY_PROMPT(self):
+        return get_prompt("summary")
+
+    @property
+    def EXTRACTION_PROMPT(self):
+        return get_prompt("extraction")
+
+    @property
+    def CONDENSE_PROMPT(self):
+        return get_prompt("condense")
+
+    @property
+    def CATEGORY_NAMES(self):
+        return get_prompt("category_names")
+
+    @property
+    def ROLE_LABELS(self):
+        return get_prompt("role_labels")
+
+
+_accessor = _PromptAccessor()
+
+# 导出兼容旧代码的变量（通过 __getattr__ 动态获取）
+def __getattr__(name):
+    if hasattr(_accessor, name):
+        return getattr(_accessor, name)
+    raise AttributeError(f"module 'prompts' has no attribute '{name}'")
