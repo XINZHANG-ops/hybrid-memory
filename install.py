@@ -102,6 +102,14 @@ def configure_hooks():
         print(f"ERROR: Hooks directory not found: {hooks_dir}")
         return False
 
+    # 在 Mac/Linux 上设置 hook 脚本执行权限
+    if sys.platform != "win32":
+        import stat
+        for py_file in hooks_dir.glob("*.py"):
+            current_mode = py_file.stat().st_mode
+            py_file.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        print(f"Set execute permissions for hook scripts")
+
     # 读取现有配置
     settings = {}
     if settings_path.exists():
