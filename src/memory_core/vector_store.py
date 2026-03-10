@@ -115,3 +115,7 @@ class VectorStore:
             "dimension": self.dimension,
             "index_path": str(self.index_path),
         }
+
+    def get_indexed_ids(self) -> set[int]:
+        """获取已索引的消息 ID 集合"""
+        return set(self.msg_to_id.keys())

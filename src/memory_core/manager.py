@@ -51,7 +51,6 @@ class MemoryManager:
         # Prompt 模板
         summary_prompt_template: str = "",
         knowledge_extraction_prompt: str = "",
-        knowledge_condense_prompt: str = "",
     ):
         logger.info("Initializing MemoryManager")
         logger.debug(f"Config: db_path={db_path}, llm_provider={llm_provider}, window_size={short_term_window_size}, max_tokens={max_context_tokens}, trigger_threshold={summary_trigger_threshold}")
@@ -97,7 +96,6 @@ class MemoryManager:
         # 保存配置供其他模块使用
         self.summary_prompt_template = summary_prompt_template
         self.knowledge_extraction_prompt = knowledge_extraction_prompt
-        self.knowledge_condense_prompt = knowledge_condense_prompt
 
         # 向量检索
         self.enable_vector_search = enable_vector_search
@@ -123,9 +121,9 @@ class MemoryManager:
                 self._llm,
                 content_config=self.content_config,
                 extraction_prompt=knowledge_extraction_prompt,
-                condense_prompt=knowledge_condense_prompt,
+                max_items_per_category=knowledge_max_items_per_category,
             )
-            logger.info("Knowledge extraction enabled")
+            logger.info(f"Knowledge extraction enabled (max_items={knowledge_max_items_per_category})")
 
         logger.info("MemoryManager initialization complete")
 
@@ -148,19 +146,8 @@ class MemoryManager:
         message = self.short_term.add(session_id, role, content, model=model)
         logger.info(f"Message added to session {session_id}: id={message.id}, model={model}")
 
-        # 实时生成 embedding 并索引
-        if self.enable_vector_search and self.embedding_client and self.vector_store:
-            try:
-                # 根据数据库路径确定来源标识
-                db_name = self.db_path.stem  # 如 "hybrid-memory" 或 "global_memory"
-                source_tag = "[Global]" if "global" in db_name.lower() else f"[{db_name}]"
-                publish_event("embedding", f"{source_tag} Embedding #{message.id}", "")
-                embedding = self.embedding_client.embed(content)
-                self.vector_store.add(message.id, embedding)
-                logger.debug(f"Message {message.id} indexed in vector store")
-            except Exception as e:
-                logger.warning(f"Failed to index message: {e}")
-                publish_event("error", f"Embedding failed: {e}", "")
+        # Embedding 由后台进程 (background_summary.py) 统一处理
+        # 不在 hook 中异步执行，避免与后台进程竞争
 
         if auto_summarize and self.long_term.should_summarize(session_id):
             logger.info(f"Summary threshold reached for session {session_id}, triggering background summarization")
@@ -173,6 +160,41 @@ class MemoryManager:
             thread.start()
             logger.debug("Background summary thread started")
         return message
+
+    def index_pending_messages(self) -> int:
+        """为尚未索引的消息生成 embedding（用于后台补充）"""
+        if not self.enable_vector_search or not self.embedding_client or not self.vector_store:
+            return 0
+
+        # 获取已索引的消息 ID
+        indexed_ids = self.vector_store.get_indexed_ids()
+
+        # 获取所有消息，找出未索引的
+        with self.db._connect() as conn:
+            rows = conn.execute("SELECT id, content FROM messages ORDER BY id DESC LIMIT 100").fetchall()
+
+        count = 0
+        db_name = self.db_path.stem
+        source_tag = "[Global]" if "global" in db_name.lower() else f"[{db_name}]"
+
+        for row in rows:
+            msg_id = row["id"]
+            if msg_id in indexed_ids:
+                continue
+
+            try:
+                content = row["content"]
+                publish_event("embedding", f"{source_tag} Embedding #{msg_id}", "")
+                embedding = self.embedding_client.embed(content)
+                self.vector_store.add(msg_id, embedding)
+                count += 1
+                logger.debug(f"Message {msg_id} indexed (batch)")
+            except Exception as e:
+                logger.warning(f"Failed to index message {msg_id}: {e}")
+
+        if count > 0:
+            logger.info(f"Indexed {count} pending messages")
+        return count
 
     def _background_summary(self, session_id: str):
         """在后台线程中执行总结和知识提取"""
@@ -218,28 +240,20 @@ class MemoryManager:
         db_name = self.db_path.stem
         source_tag = "[Global]" if "global" in db_name.lower() else f"[{db_name}]"
 
-        # 在总结前提取知识（使用相同的消息，并传入已有知识避免重复）
+        # 在总结前提取知识（LLM 直接融合旧知识+新对话，输出完整知识库）
         if self.enable_knowledge_extraction and self.knowledge_extractor:
             try:
                 publish_event("knowledge", f"{source_tag} Extracting knowledge from {len(messages)} msgs", "Sending to LLM...")
                 existing_knowledge = self.db.get_knowledge()
-                new_knowledge = self.knowledge_extractor.extract(messages, existing_knowledge)
-                if new_knowledge:
-                    # 合并新旧知识
-                    merged = self.knowledge_extractor.merge_knowledge(existing_knowledge, new_knowledge)
-
-                    # 检查是否超过每类限制，超过则自动 condense
-                    needs_condense = any(len(items) > self.knowledge_max_items_per_category for items in merged.values())
-                    if needs_condense:
-                        logger.info(f"Knowledge exceeds limit ({self.knowledge_max_items_per_category}), condensing...")
-                        publish_event("knowledge", f"{source_tag} Condensing knowledge", "Over limit, calling LLM...")
-                        merged = self.knowledge_extractor.condense_knowledge(merged, self.knowledge_max_items_per_category)
-
-                    self.db.save_knowledge(session_id, merged)
-                    new_items = sum(len(v) for v in new_knowledge.values())
-                    total_items = sum(len(v) for v in merged.values())
-                    logger.info(f"Extracted {new_items} new items, total {total_items} knowledge items")
-                    publish_event("knowledge_done", f"{source_tag} +{new_items} items (total: {total_items})", "")
+                knowledge = self.knowledge_extractor.extract(messages, existing_knowledge)
+                if knowledge:
+                    # 直接保存（覆盖旧知识）
+                    with self.db._connect() as conn:
+                        conn.execute("DELETE FROM knowledge")
+                    self.db.save_knowledge(session_id, knowledge)
+                    total_items = sum(len(v) for v in knowledge.values())
+                    logger.info(f"Knowledge updated: {total_items} items")
+                    publish_event("knowledge_done", f"{source_tag} Updated: {total_items} items", "")
             except Exception as e:
                 logger.warning(f"Knowledge extraction during summary failed: {e}")
                 publish_event("error", f"{source_tag} Knowledge extraction failed: {e}", "")
@@ -291,7 +305,7 @@ class MemoryManager:
         return self.retriever.bm25_search(query, session_id, limit)
 
     def extract_knowledge(self, session_id: str) -> dict:
-        """从最近的消息中提取结构化知识"""
+        """从最近的消息中提取结构化知识（融合已有知识）"""
         if not self.enable_knowledge_extraction or not self.knowledge_extractor:
             logger.warning("Knowledge extraction not available")
             return {}
@@ -303,9 +317,13 @@ class MemoryManager:
         if not messages:
             return self.knowledge_extractor._empty_knowledge()
 
-        knowledge = self.knowledge_extractor.extract(messages)
+        # 获取已有知识，LLM 直接融合输出
+        existing_knowledge = self.db.get_knowledge()
+        knowledge = self.knowledge_extractor.extract(messages, existing_knowledge)
 
-        # 保存到数据库
+        # 直接保存（覆盖旧知识）
+        with self.db._connect() as conn:
+            conn.execute("DELETE FROM knowledge")
         self.db.save_knowledge(session_id, knowledge)
         return knowledge
 

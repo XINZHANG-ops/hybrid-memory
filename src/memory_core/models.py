@@ -57,3 +57,22 @@ class Interaction:
     options: str = ""  # JSON array for AskUserQuestion options
     user_response: str = ""
     timestamp: datetime = field(default_factory=datetime.now)
+
+
+DecisionStatus = Literal["pending", "confirmed", "skipped"]
+
+
+@dataclass
+class Decision:
+    id: int | None
+    project: str
+    session_id: str
+    problem: str
+    solution: str
+    status: DecisionStatus = "pending"
+    reason: str = ""              # 用户选择的原因
+    reason_options: str = ""      # JSON array of LLM 生成的候选原因
+    note: str = ""                # 用户补充说明
+    files: str = ""               # JSON array of related files
+    tags: str = ""                # JSON array of tags
+    timestamp: datetime = field(default_factory=datetime.now)

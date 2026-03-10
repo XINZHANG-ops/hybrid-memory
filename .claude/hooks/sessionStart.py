@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from loguru import logger
-from src.memory_core import MemoryManager, publish_event, ContentConfig, process_content
+from src.memory_core import MemoryManager, publish_event, ContentConfig, process_content, Database
 from src.memory_core.config import load_config
 
 # 路径配置
@@ -257,6 +257,19 @@ def main():
         if knowledge_items:
             output_parts.append(f"# [{project_name}] 累积知识:\n" + "\n".join(f"- {item}" for item in knowledge_items))
             logger.info(f"Found knowledge: {len(knowledge_items)} categories")
+
+        # 2.5 加载已确认的决策
+        inject_decision_count = config_mgr.get_int("inject_decision_count")
+        decisions = project_manager.db.get_decisions(project=project_name, status="confirmed", limit=inject_decision_count)
+        if decisions:
+            decision_lines = []
+            for d in decisions:
+                line = f"- **{d.problem}** → {d.solution}"
+                if d.reason:
+                    line += f" (因为: {d.reason})"
+                decision_lines.append(line)
+            output_parts.append(f"# [{project_name}] 相关决策:\n" + "\n".join(decision_lines))
+            logger.info(f"Injecting {len(decisions)} confirmed decisions")
 
         # 3. 加载全局记忆（搜索相关内容）
         global_manager = MemoryManager(db_path=GLOBAL_DB, **config_kwargs)

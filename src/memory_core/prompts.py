@@ -79,103 +79,69 @@ Use concise English, no more than 500 words."""
 
 # ============ Knowledge Extraction Prompts ============
 
-_EXTRACTION_PROMPT_ZH = """你是一个知识提取助手。请从以下对话中提取**新的**结构化知识点。
+_EXTRACTION_PROMPT_ZH = """你是一个知识管理助手。请根据已有知识和新对话，输出**融合后的**结构化知识。
 
-## 已有知识（删除过时或不再相关的内容， 合并相似或重复的条目）：
+## 已有知识：
 {existing_knowledge}
 
 ## 新对话内容：
 {conversation}
 
-## 请提取以下类型的**新**知识（JSON格式）：
+## 任务
+结合已有知识和新对话，输出**融合后的完整知识库**。每个类别最多 {max_items} 条。
 
+要求：
+1. **融合**：将已有知识与新对话中的信息合并
+2. **更新**：如果新对话修正了已有知识，使用新版本
+3. **去重**：合并相似或重复的条目
+4. **精简**：删除过时或不再相关的内容
+5. **限制**：每类不超过 {max_items} 条，保留最重要的
+
+## 输出格式（JSON）：
 ```json
 {{
-  "user_preferences": ["用户的偏好和习惯，如编码风格、沟通方式等"],
-  "project_decisions": ["项目中做出的重要技术决策和架构选择"],
-  "key_facts": ["需要记住的关键事实，如项目名、技术栈、用户名等"],
-  "pending_tasks": ["提到但未完成的任务或待办事项"],
-  "learned_patterns": ["观察到的用户行为模式或工作方式"],
-  "important_context": ["其他重要的上下文信息"]
+  "user_preferences": ["用户偏好和习惯"],
+  "project_decisions": ["技术决策和架构选择"],
+  "key_facts": ["关键事实"],
+  "pending_tasks": ["待办事项，已完成的用[已完成]标注"],
+  "learned_patterns": ["行为模式"],
+  "important_context": ["重要上下文"]
 }}
 ```
 
-注意：
-- **不要重复已有知识中的内容**，只提取新信息
-- 如果新对话修正或更新了已有知识，提取更新后的版本
-- 如果某个待办事项已完成，可以在 pending_tasks 中标注"[已完成] xxx"
-- 只提取确实存在的信息，没有的字段留空数组
-- 每个条目应该简洁明了
-- 用中文输出
+请直接输出 JSON："""
 
-请输出 JSON（只输出 JSON，不要其他内容）："""
+_EXTRACTION_PROMPT_EN = """You are a knowledge management assistant. Based on existing knowledge and new conversation, output **merged** structured knowledge.
 
-_EXTRACTION_PROMPT_EN = """You are a knowledge extraction assistant. Please extract **new** structured knowledge points from the following conversation.
-
-## Existing Knowledge (remove outdated or irrelevant content, merge similar or duplicate entries):
+## Existing Knowledge:
 {existing_knowledge}
 
 ## New Conversation:
 {conversation}
 
-## Please extract the following types of **new** knowledge (JSON format):
+## Task
+Combine existing knowledge with new conversation to output a **complete merged knowledge base**. Maximum {max_items} items per category.
 
+Requirements:
+1. **Merge**: Combine existing knowledge with information from new conversation
+2. **Update**: If new conversation corrects existing knowledge, use the new version
+3. **Deduplicate**: Merge similar or duplicate entries
+4. **Prune**: Remove outdated or no longer relevant content
+5. **Limit**: No more than {max_items} items per category, keep the most important
+
+## Output Format (JSON):
 ```json
 {{
-  "user_preferences": ["User preferences and habits, such as coding style, communication style, etc."],
-  "project_decisions": ["Important technical decisions and architectural choices made in the project"],
-  "key_facts": ["Key facts to remember, such as project name, tech stack, username, etc."],
-  "pending_tasks": ["Tasks mentioned but not completed, or to-do items"],
-  "learned_patterns": ["Observed user behavior patterns or work styles"],
-  "important_context": ["Other important contextual information"]
+  "user_preferences": ["User preferences and habits"],
+  "project_decisions": ["Technical decisions and architectural choices"],
+  "key_facts": ["Key facts"],
+  "pending_tasks": ["Pending tasks, mark completed ones with [Completed]"],
+  "learned_patterns": ["Behavior patterns"],
+  "important_context": ["Important context"]
 }}
 ```
 
-Notes:
-- **Do not repeat content from existing knowledge**, only extract new information
-- If the new conversation corrects or updates existing knowledge, extract the updated version
-- If a pending task is completed, mark it as "[Completed] xxx" in pending_tasks
-- Only extract information that actually exists, leave empty arrays for missing fields
-- Each entry should be concise and clear
-- Output in English
-
-Please output JSON (only JSON, no other content):"""
-
-_CONDENSE_PROMPT_ZH = """你是一个知识精炼助手。以下是某个类别的知识条目列表，数量过多需要精炼。
-
-## 类别：{category_name}
-## 当前条目（{count}条）：
-{items}
-
-## 要求
-请将这些条目精炼为不超过 {max_count} 条，要求：
-1. 合并相似或重复的条目
-2. 保留最重要、最有价值的信息
-3. 删除过时或不再相关的内容
-4. 每条保持简洁明了
-
-请直接输出精炼后的条目列表（JSON数组格式），例如：
-["条目1", "条目2", "条目3"]
-
-只输出 JSON 数组，不要其他内容："""
-
-_CONDENSE_PROMPT_EN = """You are a knowledge condensation assistant. The following is a list of knowledge entries for a category that has too many items and needs to be condensed.
-
-## Category: {category_name}
-## Current Entries ({count} items):
-{items}
-
-## Requirements
-Please condense these entries to no more than {max_count} items:
-1. Merge similar or duplicate entries
-2. Keep the most important and valuable information
-3. Remove outdated or no longer relevant content
-4. Keep each entry concise and clear
-
-Please output the condensed list directly (JSON array format), for example:
-["Entry 1", "Entry 2", "Entry 3"]
-
-Only output JSON array, no other content:"""
+Please output JSON directly:"""
 
 # ============ Category Names ============
 
@@ -228,7 +194,6 @@ _PROMPTS = {
         "summary_with_context": _SUMMARY_PROMPT_WITH_CONTEXT_ZH,
         "summary": _SUMMARY_PROMPT_ZH,
         "extraction": _EXTRACTION_PROMPT_ZH,
-        "condense": _CONDENSE_PROMPT_ZH,
         "category_names": _CATEGORY_NAMES_ZH,
         "role_labels": _ROLE_LABELS_ZH,
         "ui_text": _UI_TEXT_ZH,
@@ -237,7 +202,6 @@ _PROMPTS = {
         "summary_with_context": _SUMMARY_PROMPT_WITH_CONTEXT_EN,
         "summary": _SUMMARY_PROMPT_EN,
         "extraction": _EXTRACTION_PROMPT_EN,
-        "condense": _CONDENSE_PROMPT_EN,
         "category_names": _CATEGORY_NAMES_EN,
         "role_labels": _ROLE_LABELS_EN,
         "ui_text": _UI_TEXT_EN,
@@ -287,10 +251,6 @@ class _PromptAccessor:
     @property
     def EXTRACTION_PROMPT(self):
         return get_prompt("extraction")
-
-    @property
-    def CONDENSE_PROMPT(self):
-        return get_prompt("condense")
 
     @property
     def CATEGORY_NAMES(self):

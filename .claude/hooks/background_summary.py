@@ -11,8 +11,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from loguru import logger
-from src.memory_core import MemoryManager, publish_event
+from src.memory_core import MemoryManager, publish_event, DecisionExtractor, Decision
 from src.memory_core.config import load_config
+from src.memory_core.database import Database
+from src.memory_core.llm_client import create_llm_client
 
 # 路径配置
 MEMORY_BASE = Path(__file__).parent.parent.parent / "data"
@@ -22,6 +24,43 @@ MEMORY_BASE.mkdir(parents=True, exist_ok=True)
 # 配置日志
 logger.remove()
 logger.add(LOG_FILE, level="DEBUG", rotation="1 MB", retention="1 hour")
+
+
+def extract_decision(project_name: str, session_id: str, project_db: Path, config_mgr):
+    """从最近的对话中提取决策"""
+    logger.info(f"[Background] Extracting decision for {project_name}")
+    publish_event("decision", "Extracting decision from conversation", project_name)
+
+    db = Database(project_db)
+
+    # 获取最近的消息
+    messages = db.get_messages(session_id, limit=20)
+    if len(messages) < 3:
+        logger.info("[Background] Not enough messages for decision extraction")
+        return
+
+    # 转换为简单格式
+    msg_list = [{"role": m.role, "content": m.content} for m in messages]
+
+    # 创建 LLM 客户端
+    llm_client = create_llm_client(
+        provider=config_mgr.get("llm_provider"),
+        ollama_model=config_mgr.get("ollama_model"),
+        ollama_base_url=config_mgr.get("ollama_base_url"),
+        ollama_timeout=float(config_mgr.get("ollama_timeout") or 300),
+        ollama_keep_alive=config_mgr.get("ollama_keep_alive"),
+    )
+
+    # 提取决策
+    extractor = DecisionExtractor(llm_client)
+    decision = extractor.extract_decision(msg_list, project_name, session_id)
+
+    if decision:
+        db.add_decision(decision)
+        logger.info(f"[Background] Decision saved: {decision.problem[:50]}...")
+        publish_event("decision_done", f"Decision extracted: {decision.problem[:50]}...", project_name)
+    else:
+        logger.info("[Background] No decision detected in conversation")
 
 
 def main():
@@ -34,10 +73,13 @@ def main():
     project_db = Path(sys.argv[3])
     global_db = Path(sys.argv[4])
     no_end_session = "--no-end-session" in sys.argv
+    embedding_only = "--embedding-only" in sys.argv
     global_session_id = f"{project_name}:{session_id}"
 
-    if no_end_session:
-        logger.info(f"[Background] Starting summary (no end_session) for project={project_name}, session={session_id}")
+    if embedding_only:
+        logger.info(f"[Background] Starting embedding-only for project={project_name}")
+    elif no_end_session:
+        logger.info(f"[Background] Starting summary for project={project_name}, session={session_id}")
     else:
         logger.info(f"[Background] Starting end_session for project={project_name}, session={session_id}")
 
@@ -49,34 +91,51 @@ def main():
         project_manager = MemoryManager(db_path=project_db, **config_kwargs)
         global_manager = MemoryManager(db_path=global_db, **config_kwargs)
 
-        if no_end_session:
-            # 只触发总结，不结束会话
-            project_summary = project_manager.trigger_summary(session_id)
-            if project_summary:
-                logger.info(f"[Background][Project] Summary created: id={project_summary.id}")
-                publish_event("summary_done", f"Summary created: #{project_summary.id}", project_name)
-            else:
-                logger.info(f"[Background][Project] No summary needed")
+        if not embedding_only:
+            if no_end_session:
+                # 只触发总结，不结束会话
+                project_summary = project_manager.trigger_summary(session_id)
+                if project_summary:
+                    logger.info(f"[Background][Project] Summary created: id={project_summary.id}")
+                    publish_event("summary_done", f"Summary created: #{project_summary.id}", project_name)
+                else:
+                    logger.info(f"[Background][Project] No summary needed")
 
-            global_summary = global_manager.trigger_summary(global_session_id)
-            if global_summary:
-                logger.info(f"[Background][Global] Summary created: id={global_summary.id}")
+                global_summary = global_manager.trigger_summary(global_session_id)
+                if global_summary:
+                    logger.info(f"[Background][Global] Summary created: id={global_summary.id}")
+                else:
+                    logger.info(f"[Background][Global] No summary needed")
             else:
-                logger.info(f"[Background][Global] No summary needed")
-        else:
-            # 结束会话（包含总结）
-            project_summary = project_manager.end_session(session_id)
-            if project_summary:
-                logger.info(f"[Background][Project] Session ended with summary: id={project_summary.id}")
-                publish_event("summary_done", f"Summary created: #{project_summary.id}", project_name)
-            else:
-                logger.info(f"[Background][Project] Session ended without summary")
+                # 结束会话（包含总结）
+                project_summary = project_manager.end_session(session_id)
+                if project_summary:
+                    logger.info(f"[Background][Project] Session ended with summary: id={project_summary.id}")
+                    publish_event("summary_done", f"Summary created: #{project_summary.id}", project_name)
+                else:
+                    logger.info(f"[Background][Project] Session ended without summary")
 
-            global_summary = global_manager.end_session(global_session_id)
-            if global_summary:
-                logger.info(f"[Background][Global] Session ended with summary: id={global_summary.id}")
-            else:
-                logger.info(f"[Background][Global] Session ended without summary")
+                global_summary = global_manager.end_session(global_session_id)
+                if global_summary:
+                    logger.info(f"[Background][Global] Session ended with summary: id={global_summary.id}")
+                else:
+                    logger.info(f"[Background][Global] Session ended without summary")
+
+        # 补充执行 embedding（hook 中跳过的）
+        try:
+            project_indexed = project_manager.index_pending_messages()
+            global_indexed = global_manager.index_pending_messages()
+            if project_indexed or global_indexed:
+                logger.info(f"[Background] Indexed pending: project={project_indexed}, global={global_indexed}")
+        except Exception as e:
+            logger.error(f"[Background] Embedding error: {e}")
+
+        # 决策提取（在总结或会话结束时触发，非 embedding-only）
+        if not embedding_only:
+            try:
+                extract_decision(project_name, session_id, project_db, config_mgr)
+            except Exception as e:
+                logger.error(f"[Background] Decision extraction error: {e}")
 
         logger.info(f"[Background] Processing completed for {project_name}")
         publish_event("background_done", f"Background processing completed", project_name)

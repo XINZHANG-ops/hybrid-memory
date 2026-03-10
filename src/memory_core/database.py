@@ -3,7 +3,7 @@ from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime
 from loguru import logger
-from .models import Message, Summary, Session, TokenUsage, Interaction
+from .models import Message, Summary, Session, TokenUsage, Interaction, Decision
 
 DEFAULT_DB_PATH = Path(__file__).parent.parent.parent / "data" / "memory.db"
 
@@ -75,6 +75,22 @@ CREATE TABLE IF NOT EXISTS interactions (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY,
+    project TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    problem TEXT NOT NULL,
+    solution TEXT NOT NULL,
+    status TEXT DEFAULT 'pending',
+    reason TEXT DEFAULT '',
+    reason_options TEXT DEFAULT '[]',
+    note TEXT DEFAULT '',
+    files TEXT DEFAULT '[]',
+    tags TEXT DEFAULT '[]',
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_session ON knowledge(session_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_category ON knowledge(category);
@@ -84,6 +100,9 @@ CREATE INDEX IF NOT EXISTS idx_token_usage_session ON token_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
 CREATE INDEX IF NOT EXISTS idx_interactions_session ON interactions(session_id);
 CREATE INDEX IF NOT EXISTS idx_interactions_timestamp ON interactions(timestamp);
+CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project);
+CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status);
+CREATE INDEX IF NOT EXISTS idx_decisions_timestamp ON decisions(timestamp);
 """
 
 
@@ -585,5 +604,140 @@ class Database:
             request_content=row["request_content"] or "",
             options=row["options"] or "",
             user_response=row["user_response"] or "",
+            timestamp=row["timestamp"] if isinstance(row["timestamp"], datetime) else datetime.fromisoformat(row["timestamp"]),
+        )
+
+    # Decision CRUD operations
+    def add_decision(self, decision: Decision) -> Decision:
+        logger.debug(f"Adding decision: project={decision.project}, problem={decision.problem[:50]}...")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """INSERT INTO decisions (project, session_id, problem, solution, status, reason, reason_options, note, files, tags, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    decision.project,
+                    decision.session_id,
+                    decision.problem,
+                    decision.solution,
+                    decision.status,
+                    decision.reason,
+                    decision.reason_options,
+                    decision.note,
+                    decision.files,
+                    decision.tags,
+                    decision.timestamp,
+                ),
+            )
+            decision.id = cursor.lastrowid
+            logger.info(f"Decision added: id={decision.id}, project={decision.project}")
+            return decision
+
+    def get_decisions(self, project: str | None = None, status: str | None = None, limit: int = 100) -> list[Decision]:
+        logger.debug(f"Getting decisions: project={project}, status={status}, limit={limit}")
+        with self._connect() as conn:
+            query = "SELECT * FROM decisions WHERE 1=1"
+            params: list = []
+            if project:
+                query += " AND project = ?"
+                params.append(project)
+            if status:
+                query += " AND status = ?"
+                params.append(status)
+            query += " ORDER BY timestamp DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
+            decisions = [self._row_to_decision(row) for row in rows]
+            logger.debug(f"Retrieved {len(decisions)} decisions")
+            return decisions
+
+    def get_decision_by_id(self, decision_id: int) -> Decision | None:
+        logger.debug(f"Getting decision by id: {decision_id}")
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM decisions WHERE id = ?",
+                (decision_id,),
+            ).fetchone()
+            if row:
+                return self._row_to_decision(row)
+            return None
+
+    def update_decision(self, decision_id: int, **kwargs) -> bool:
+        logger.debug(f"Updating decision: id={decision_id}, fields={list(kwargs.keys())}")
+        if not kwargs:
+            return False
+        allowed_fields = {"status", "reason", "note", "tags"}
+        fields = {k: v for k, v in kwargs.items() if k in allowed_fields}
+        if not fields:
+            return False
+        set_clause = ", ".join(f"{k} = ?" for k in fields.keys())
+        values = list(fields.values()) + [decision_id]
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE decisions SET {set_clause} WHERE id = ?",
+                values,
+            )
+            updated = cursor.rowcount > 0
+            if updated:
+                logger.info(f"Decision updated: id={decision_id}, fields={list(fields.keys())}")
+            return updated
+
+    def delete_decision(self, decision_id: int) -> bool:
+        logger.debug(f"Deleting decision: id={decision_id}")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM decisions WHERE id = ?",
+                (decision_id,),
+            )
+            deleted = cursor.rowcount > 0
+            if deleted:
+                logger.info(f"Decision deleted: id={decision_id}")
+            return deleted
+
+    def count_pending_decisions(self, project: str | None = None) -> int:
+        logger.debug(f"Counting pending decisions: project={project}")
+        with self._connect() as conn:
+            if project:
+                row = conn.execute(
+                    "SELECT COUNT(*) as count FROM decisions WHERE status = 'pending' AND project = ?",
+                    (project,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) as count FROM decisions WHERE status = 'pending'"
+                ).fetchone()
+            count = row["count"] if row else 0
+            logger.debug(f"Pending decisions count: {count}")
+            return count
+
+    def search_decisions(self, query: str, project: str | None = None, limit: int = 20) -> list[Decision]:
+        logger.debug(f"Searching decisions: query={query}, project={project}")
+        with self._connect() as conn:
+            sql = """SELECT * FROM decisions
+                     WHERE status = 'confirmed'
+                     AND (problem LIKE ? OR solution LIKE ? OR reason LIKE ? OR note LIKE ?)"""
+            params: list = [f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%"]
+            if project:
+                sql += " AND project = ?"
+                params.append(project)
+            sql += " ORDER BY timestamp DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+            decisions = [self._row_to_decision(row) for row in rows]
+            logger.debug(f"Found {len(decisions)} decisions matching '{query}'")
+            return decisions
+
+    def _row_to_decision(self, row: sqlite3.Row) -> Decision:
+        return Decision(
+            id=row["id"],
+            project=row["project"],
+            session_id=row["session_id"],
+            problem=row["problem"],
+            solution=row["solution"],
+            status=row["status"],
+            reason=row["reason"] or "",
+            reason_options=row["reason_options"] or "[]",
+            note=row["note"] or "",
+            files=row["files"] or "[]",
+            tags=row["tags"] or "[]",
             timestamp=row["timestamp"] if isinstance(row["timestamp"], datetime) else datetime.fromisoformat(row["timestamp"]),
         )

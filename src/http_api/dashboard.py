@@ -37,7 +37,7 @@ logger.add(
 )
 from src.memory_core import (
     MemoryManager, ConfigManager, DEFAULT_CONFIG, CONFIG_META,
-    EXTRACTION_PROMPT, CONDENSE_PROMPT, SUMMARY_PROMPT, SUMMARY_PROMPT_WITH_CONTEXT,
+    EXTRACTION_PROMPT, SUMMARY_PROMPT, SUMMARY_PROMPT_WITH_CONTEXT,
     ContentConfig, process_content
 )
 from src.memory_core.database import Database
@@ -349,6 +349,46 @@ def regenerate_all_summaries(project_name):
     return json_response({"status": "ok", "regenerated": regenerated})
 
 
+@app.route("/api/projects/<project_name>/summaries/trigger", methods=["POST"])
+def trigger_summary(project_name):
+    """手动触发总结（不管是否达到阈值）"""
+    from src.memory_core.config import load_config
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+
+    db = Database(db_path)
+    config_mgr = load_config(GLOBAL_DB)
+    config_kwargs = config_mgr.get_memory_manager_kwargs()
+
+    manager = MemoryManager(db_path=db_path, **config_kwargs)
+
+    # 获取最新 session
+    with db._connect() as conn:
+        row = conn.execute("SELECT session_id FROM sessions ORDER BY last_active_at DESC LIMIT 1").fetchone()
+    session_id = row[0] if row else f"{project_name}-session"
+
+    # 检查是否有未总结的消息
+    unsummarized = db.count_unsummarized_messages(session_id=None)
+    if unsummarized == 0:
+        return json_response({"message": "No unsummarized messages", "created": False})
+
+    publish_event("summary", f"Manually triggering summary ({unsummarized} messages)", project_name)
+
+    # 触发总结
+    summary = manager.trigger_summary(session_id)
+    if summary:
+        publish_event("summary_done", f"Summary #{summary.id} created", project_name)
+        return json_response({
+            "message": f"Summary created",
+            "created": True,
+            "summary_id": summary.id,
+            "message_count": summary.message_count
+        })
+    else:
+        return json_response({"message": "Summary generation failed", "created": False})
+
+
 @app.route("/api/projects/<project_name>/summaries/selection", methods=["GET"])
 def get_summary_selection(project_name):
     db = Database(GLOBAL_DB)
@@ -625,65 +665,11 @@ def get_knowledge(project_name):
     from src.memory_core.config import load_config
     config_mgr = load_config(GLOBAL_DB)
     max_per_category = config_mgr.get_int("knowledge_max_items_per_category")
-    auto_condense = config_mgr.get("knowledge_auto_condense") == "true"
-
-    # 检查是否有类别超过限制
-    needs_condense = any(len(items) > max_per_category for items in knowledge.values())
 
     return json_response({
         "knowledge": knowledge,
         "max_per_category": max_per_category,
-        "needs_condense": needs_condense,
-        "auto_condense": auto_condense,
     })
-
-
-@app.route("/api/projects/<project_name>/knowledge/condense", methods=["POST"])
-def condense_knowledge(project_name):
-    """精炼知识：将超过限制的类别压缩到指定数量"""
-    db_path = PROJECTS_DIR / f"{project_name}.db"
-    if not db_path.exists():
-        return json_response({"error": "Project not found"}), 404
-    db = Database(db_path)
-    knowledge = db.get_knowledge()
-
-    from src.memory_core.config import load_config
-    from src.memory_core.knowledge_extractor import KnowledgeExtractor
-    from src.memory_core.llm_client import create_llm_client
-
-    config_mgr = load_config(GLOBAL_DB)
-    max_per_category = config_mgr.get_int("knowledge_max_items_per_category")
-
-    # 检查是否需要精炼
-    needs_condense = any(len(items) > max_per_category for items in knowledge.values())
-    if not needs_condense:
-        return json_response({"status": "ok", "message": "No condensing needed", "knowledge": knowledge})
-
-    from src.memory_core.events import publish_event
-    total_before = sum(len(v) for v in knowledge.values())
-    publish_event("knowledge", f"Condensing {total_before} knowledge items", project_name)
-
-    # 创建 LLM 客户端
-    llm_client = create_llm_client(
-        provider=config_mgr.get("llm_provider"),
-        ollama_model=config_mgr.get("ollama_model"),
-        ollama_base_url=config_mgr.get("ollama_base_url"),
-        ollama_timeout=float(config_mgr.get("ollama_timeout")),
-        ollama_keep_alive=config_mgr.get("ollama_keep_alive"),
-    )
-
-    extractor = KnowledgeExtractor(llm_client)
-    condensed = extractor.condense_knowledge(knowledge, max_per_category)
-
-    # 更新数据库：删除旧的知识，保存精炼后的
-    with db._connect() as conn:
-        conn.execute("DELETE FROM knowledge")
-    db.save_knowledge(None, condensed)
-
-    total_after = sum(len(v) for v in condensed.values())
-    publish_event("knowledge_done", f"Condensed: {total_before} → {total_after} items", project_name)
-
-    return json_response({"status": "ok", "knowledge": condensed})
 
 
 @app.route("/api/projects/<project_name>/knowledge/extract", methods=["POST"])
@@ -730,22 +716,22 @@ def extract_knowledge(project_name):
         max_chars_tool=config_mgr.get_int("content_max_chars_tool"),
         max_chars_text=config_mgr.get_int("content_max_chars_text"),
     )
-    extractor = KnowledgeExtractor(llm_client, content_config=content_config)
+    max_items = config_mgr.get_int("knowledge_max_items_per_category")
+    extractor = KnowledgeExtractor(llm_client, content_config=content_config, max_items_per_category=max_items)
 
-    # 获取已有知识，传给提取器避免重复
+    # 获取已有知识
     existing = db.get_knowledge()
 
-    # 提取新知识（模型能看到已有知识）
-    new_knowledge = extractor.extract(messages, existing)
+    # 提取并融合知识（LLM 直接输出融合后的完整知识库）
+    knowledge = extractor.extract(messages, existing)
 
-    # 合并新旧知识
-    merged = extractor.merge_knowledge(existing, new_knowledge)
+    # 直接保存（覆盖旧知识）
+    with db._connect() as conn:
+        conn.execute("DELETE FROM knowledge")
+    db.save_knowledge(None, knowledge)
 
-    # 保存
-    db.save_knowledge(None, merged)
-
-    total_items = sum(len(v) for v in new_knowledge.values())
-    publish_event("knowledge_done", f"Extracted {total_items} new items", project_name)
+    total_items = sum(len(v) for v in knowledge.values())
+    publish_event("knowledge_done", f"Knowledge updated: {total_items} items", project_name)
 
     return json_response({"status": "ok", "extracted": new_knowledge, "total": merged})
 
@@ -903,6 +889,114 @@ def get_summary_debug(project_name):
     })
 
 
+# ========== Decisions API ==========
+
+@app.route("/api/projects/<project_name>/decisions")
+def get_decisions(project_name):
+    """获取决策列表"""
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+
+    status = request.args.get("status")  # pending, confirmed, skipped
+    limit = int(request.args.get("limit", 100))
+
+    db = Database(db_path)
+    decisions = db.get_decisions(project=project_name, status=status, limit=limit)
+
+    return json_response({
+        "decisions": [{
+            "id": d.id,
+            "project": d.project,
+            "session_id": d.session_id,
+            "problem": d.problem,
+            "solution": d.solution,
+            "status": d.status,
+            "reason": d.reason,
+            "reason_options": json.loads(d.reason_options) if d.reason_options else [],
+            "note": d.note,
+            "files": json.loads(d.files) if d.files else [],
+            "tags": json.loads(d.tags) if d.tags else [],
+            "timestamp": d.timestamp.isoformat() if d.timestamp else None,
+        } for d in decisions],
+        "pending_count": db.count_pending_decisions(project_name),
+    })
+
+
+@app.route("/api/projects/<project_name>/decisions/<int:decision_id>", methods=["PUT"])
+def update_decision(project_name, decision_id):
+    """更新决策（确认/跳过/添加备注）"""
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+
+    data = request.get_json() or {}
+    db = Database(db_path)
+
+    # 允许更新的字段
+    update_fields = {}
+    if "status" in data:
+        update_fields["status"] = data["status"]
+    if "reason" in data:
+        update_fields["reason"] = data["reason"]
+    if "note" in data:
+        update_fields["note"] = data["note"]
+    if "tags" in data:
+        update_fields["tags"] = json.dumps(data["tags"]) if isinstance(data["tags"], list) else data["tags"]
+
+    if update_fields:
+        success = db.update_decision(decision_id, **update_fields)
+        if success:
+            return json_response({"success": True, "message": "Decision updated"})
+        return json_response({"error": "Decision not found"}), 404
+
+    return json_response({"error": "No valid fields to update"}), 400
+
+
+@app.route("/api/projects/<project_name>/decisions/<int:decision_id>", methods=["DELETE"])
+def delete_decision(project_name, decision_id):
+    """删除决策"""
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+
+    db = Database(db_path)
+    success = db.delete_decision(decision_id)
+
+    if success:
+        return json_response({"success": True, "message": "Decision deleted"})
+    return json_response({"error": "Decision not found"}), 404
+
+
+@app.route("/api/projects/<project_name>/decisions/search")
+def search_decisions(project_name):
+    """搜索已确认的决策"""
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+
+    query = request.args.get("q", "")
+    limit = int(request.args.get("limit", 20))
+
+    if not query:
+        return json_response({"error": "Query parameter 'q' is required"}), 400
+
+    db = Database(db_path)
+    decisions = db.search_decisions(query, project=project_name, limit=limit)
+
+    return json_response({
+        "query": query,
+        "decisions": [{
+            "id": d.id,
+            "problem": d.problem,
+            "solution": d.solution,
+            "reason": d.reason,
+            "note": d.note,
+            "timestamp": d.timestamp.isoformat() if d.timestamp else None,
+        } for d in decisions],
+    })
+
+
 @app.route("/api/logs")
 def get_logs():
     """获取合并的日志（app.log + hooks.log）"""
@@ -998,7 +1092,6 @@ def get_config():
         "default_prompts": {
             "summary_prompt_template": get_prompt("summary_with_context"),
             "knowledge_extraction_prompt": get_prompt("extraction"),
-            "knowledge_condense_prompt": get_prompt("condense"),
         },
         "i18n": {
             "category_names": get_prompt("category_names"),
@@ -1268,6 +1361,7 @@ def index():
             <button class="tab" onclick="showPanel('context')">Injected Context</button>
             <button class="tab" onclick="showPanel('search')">Search</button>
             <button class="tab" onclick="showPanel('knowledge')">Knowledge</button>
+            <button class="tab" onclick="showPanel('decisions')">Decisions <span id="pending-decisions-badge" class="badge" style="display:none;"></span></button>
             <button class="tab" onclick="showPanel('logs')">Logs</button>
         </div>
 
@@ -1303,6 +1397,7 @@ def index():
         <div id="summaries" class="panel">
             <h2>Summaries</h2>
             <div style="margin-bottom: 15px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+                <button onclick="triggerSummary()" style="background: #4a90d9;">Summarize Now</button>
                 <button onclick="regenerateAllSummaries()" style="background: #e94560;">Regenerate All</button>
                 <button onclick="saveSummarySelection()">Save Extra Selection</button>
                 <span id="selection-dirty-hint" style="color: #ffcc00; margin-left: 5px; display: none;">● Unsaved</span>
@@ -1486,8 +1581,7 @@ def index():
             <h2>Structured Knowledge</h2>
             <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px; align-items: center;">
                 <button onclick="loadKnowledge()" title="Reload current knowledge from database">Refresh</button>
-                <button onclick="extractKnowledge()" style="background: #4a90d9;" title="Extract NEW knowledge from unsummarized messages (incremental)">Extract New</button>
-                <button id="condense-btn" onclick="condenseKnowledge()" style="background: #e94560;" title="Condense/refine existing knowledge (merge duplicates, remove outdated)">Condense</button>
+                <button onclick="extractKnowledge()" style="background: #4a90d9;" title="Extract NEW knowledge from unsummarized messages (fuses with existing)">Extract New</button>
                 <button onclick="loadKnowledgeDebug()" style="background: #6c5ce7; color: #fff;" title="View the prompt that will be sent to LLM">View Prompt</button>
                 <span id="knowledge-status" style="color: #888; font-size: 0.85em; margin-left: 10px;"></span>
             </div>
@@ -1539,6 +1633,31 @@ def index():
                 </div>
             </div>
         </div>
+
+        <!-- Decisions Panel -->
+        <div id="decisions" class="panel">
+            <h2>Decisions</h2>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px; align-items: center;">
+                <button onclick="loadDecisions()" title="Refresh decisions list">Refresh</button>
+                <button onclick="filterDecisions('pending')" id="filter-pending-btn" style="background: #e94560;">Pending</button>
+                <button onclick="filterDecisions('confirmed')" id="filter-confirmed-btn" style="background: #333;">Confirmed</button>
+                <button onclick="filterDecisions('')" id="filter-all-btn" style="background: #333;">All</button>
+                <input type="text" id="decision-search" placeholder="Search decisions..." onkeyup="searchDecisionsDebounced()" style="padding: 8px 12px; flex: 1; min-width: 200px;">
+                <span id="decisions-status" style="color: #888; font-size: 0.85em; margin-left: 10px;"></span>
+            </div>
+
+            <!-- Pending Decisions -->
+            <div id="pending-decisions-section">
+                <h3 style="color: #e94560; margin-bottom: 10px;">Pending Decisions <span id="pending-count-label"></span></h3>
+                <div id="pending-decisions-list"></div>
+            </div>
+
+            <!-- Confirmed/All Decisions -->
+            <div id="confirmed-decisions-section" style="margin-top: 20px;">
+                <h3 style="color: #00d9ff; margin-bottom: 10px;">Confirmed Decisions</h3>
+                <div id="confirmed-decisions-list"></div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -1577,6 +1696,8 @@ def index():
             // Auto-load data for specific panels
             if (id === 'knowledge' && currentProject) {
                 loadKnowledge();
+            } else if (id === 'decisions' && currentProject) {
+                loadDecisions();
             } else if (id === 'search' && currentProject) {
                 loadVectorStats();
             } else if (id === 'logs') {
@@ -2158,6 +2279,26 @@ def index():
             renderSummaries();
         }
 
+        async function triggerSummary() {
+            if (!currentProject) return;
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Summarizing...';
+            try {
+                const res = await fetch(`/api/projects/${currentProject}/summaries/trigger`, {method: 'POST'});
+                const data = await res.json();
+                if (data.created) {
+                    loadSummaries();
+                } else {
+                    alert(data.message || 'No summary created');
+                }
+            } catch (e) {
+                console.error('Trigger summary error:', e);
+            }
+            btn.disabled = false;
+            btn.textContent = 'Summarize Now';
+        }
+
         async function regenerateAllSummaries() {
             if (!currentProject) return;
             const btn = event.target;
@@ -2493,7 +2634,7 @@ def index():
                 },
                 'Knowledge': {
                     icon: '📚',
-                    keys: ['enable_knowledge_extraction', 'knowledge_max_items_per_category', 'knowledge_auto_condense']
+                    keys: ['enable_knowledge_extraction', 'knowledge_max_items_per_category']
                 },
                 'Content': {
                     icon: '📄',
@@ -2517,7 +2658,7 @@ def index():
                 },
                 'Prompts': {
                     icon: '✏️',
-                    keys: ['prompt_language', 'summary_prompt_template', 'knowledge_extraction_prompt', 'knowledge_condense_prompt']
+                    keys: ['prompt_language', 'summary_prompt_template', 'knowledge_extraction_prompt']
                 }
             };
 
@@ -2585,9 +2726,9 @@ def index():
                 'summary_max_chars_total',
                 'content_include_thinking', 'content_include_tool', 'content_include_text',
                 'content_max_chars_thinking', 'content_max_chars_tool', 'content_max_chars_text',
-                'knowledge_max_items_per_category', 'knowledge_auto_condense',
+                'knowledge_max_items_per_category',
                 'search_result_preview_length', 'dashboard_refresh_interval',
-                'prompt_language', 'summary_prompt_template', 'knowledge_extraction_prompt', 'knowledge_condense_prompt'
+                'prompt_language', 'summary_prompt_template', 'knowledge_extraction_prompt'
             ];
             for (const key of configKeys) {
                 const el = document.getElementById(`config-${key}`);
@@ -2729,46 +2870,17 @@ def index():
             let data = await res.json();
             document.getElementById('knowledge-status').textContent = '';
 
-            // 不再在加载时自动 condense - condense 只在提取后超限时自动触发，或手动点击
-
             const k = data.knowledge || {};
             const maxPerCategory = data.max_per_category || 10;
             const categories = ['user-preferences', 'project-decisions', 'key-facts', 'pending-tasks', 'learned-patterns', 'important-context'];
             const keys = ['user_preferences', 'project_decisions', 'key_facts', 'pending_tasks', 'learned_patterns', 'important_context'];
             for (let i = 0; i < categories.length; i++) {
                 const items = k[keys[i]] || [];
-                const isOverLimit = items.length > maxPerCategory;
-                const badge = isOverLimit ? `<span style="color: #ffcc00; font-size: 0.8em;"> (${items.length}/${maxPerCategory} - needs condensing)</span>` : ` (${items.length})`;
+                const badge = ` (${items.length}/${maxPerCategory})`;
                 document.getElementById(`k-${categories[i]}`).innerHTML = items.length > 0
                     ? `<div style="color: #888; margin-bottom: 5px; font-size: 0.85em;">${badge}</div>` + items.map(item => `<li style="margin: 5px 0; color: #ccc;">${escapeHtml(item)}</li>`).join('')
                     : '<li style="color: #666;">No items</li>';
             }
-
-            // 更新精炼按钮状态（始终显示，但根据需要调整样式）
-            const condenseBtn = document.getElementById('condense-btn');
-            if (condenseBtn) {
-                const totalItems = Object.values(k).flat().length;
-                if (data.needs_condense) {
-                    condenseBtn.style.background = '#e94560';
-                    condenseBtn.style.opacity = '1';
-                    condenseBtn.title = `Condense needed! Some categories exceed ${maxPerCategory} items limit`;
-                } else {
-                    condenseBtn.style.background = '#666';
-                    condenseBtn.style.opacity = '0.7';
-                    condenseBtn.title = `Condense/refine ${totalItems} items (no categories over limit)`;
-                }
-            }
-        }
-
-        async function condenseKnowledge() {
-            if (!currentProject) return;
-            const btn = document.getElementById('condense-btn');
-            btn.disabled = true;
-            btn.textContent = 'Condensing...';
-            await fetch(`/api/projects/${currentProject}/knowledge/condense`, {method: 'POST'});
-            btn.disabled = false;
-            btn.textContent = 'Condense';
-            loadKnowledge();
         }
 
         async function extractKnowledge() {
@@ -2820,6 +2932,205 @@ def index():
             document.getElementById('knowledge-debug-existing').textContent = data.existing_knowledge || noKnowledgeText;
             document.getElementById('knowledge-debug-prompt').textContent = data.full_prompt || 'No prompt';
             document.getElementById('knowledge-debug-panel').style.display = 'block';
+        }
+
+        // ========== Decisions Functions ==========
+        let currentDecisionFilter = 'pending';
+        let searchDecisionsTimeout = null;
+
+        async function loadDecisions() {
+            if (!currentProject) return;
+            document.getElementById('decisions-status').textContent = 'Loading...';
+
+            try {
+                const res = await fetch(`/api/projects/${currentProject}/decisions?status=${currentDecisionFilter}`);
+                const data = await res.json();
+
+                // Update pending badge
+                const badge = document.getElementById('pending-decisions-badge');
+                if (data.pending_count > 0) {
+                    badge.textContent = data.pending_count;
+                    badge.style.display = 'inline';
+                } else {
+                    badge.style.display = 'none';
+                }
+
+                document.getElementById('pending-count-label').textContent = `(${data.pending_count})`;
+
+                // Separate pending and confirmed
+                const pending = data.decisions.filter(d => d.status === 'pending');
+                const confirmed = data.decisions.filter(d => d.status === 'confirmed');
+
+                // Render pending decisions
+                document.getElementById('pending-decisions-list').innerHTML = pending.length > 0
+                    ? pending.map(d => renderPendingDecision(d)).join('')
+                    : '<div style="color: #888; padding: 10px;">No pending decisions</div>';
+
+                // Render confirmed decisions
+                document.getElementById('confirmed-decisions-list').innerHTML = confirmed.length > 0
+                    ? confirmed.map(d => renderConfirmedDecision(d)).join('')
+                    : '<div style="color: #888; padding: 10px;">No confirmed decisions</div>';
+
+                document.getElementById('decisions-status').textContent = '';
+            } catch (e) {
+                document.getElementById('decisions-status').textContent = 'Error: ' + e.message;
+            }
+        }
+
+        function renderPendingDecision(d) {
+            const options = d.reason_options || [];
+            const files = d.files || [];
+            return `
+                <div class="card" style="margin-bottom: 15px; border-left: 3px solid #e94560;">
+                    <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px;">
+                        <span style="color: #888; font-size: 0.85em;">#${d.id} · ${new Date(d.timestamp).toLocaleString()}</span>
+                        <div style="display: flex; gap: 5px;">
+                            <button onclick="skipDecision(${d.id})" style="padding: 4px 10px; background: #333; font-size: 0.85em;">Skip</button>
+                            <button onclick="deleteDecision(${d.id})" style="padding: 4px 10px; background: #e94560; font-size: 0.85em;">Delete</button>
+                        </div>
+                    </div>
+                    <div style="margin-bottom: 8px;">
+                        <strong style="color: #00d9ff;">Problem:</strong>
+                        <div style="margin-top: 4px; color: #ccc;">${escapeHtml(d.problem)}</div>
+                    </div>
+                    <div style="margin-bottom: 8px;">
+                        <strong style="color: #4ad9a0;">Solution:</strong>
+                        <div style="margin-top: 4px; color: #ccc;">${escapeHtml(d.solution)}</div>
+                    </div>
+                    ${files.length > 0 ? `<div style="margin-bottom: 8px; color: #888; font-size: 0.85em;">Files: ${files.map(f => `<code>${escapeHtml(f)}</code>`).join(', ')}</div>` : ''}
+                    <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #333;">
+                        <strong style="color: #d9a04a;">Select Reason:</strong>
+                        <div id="reason-options-${d.id}" style="margin-top: 8px;">
+                            ${options.map((opt, i) => `
+                                <label style="display: block; margin-bottom: 6px; cursor: pointer;">
+                                    <input type="radio" name="reason-${d.id}" value="${escapeHtml(opt)}" style="margin-right: 8px;">
+                                    ${escapeHtml(opt)}
+                                </label>
+                            `).join('')}
+                            <label style="display: block; margin-bottom: 6px; cursor: pointer;">
+                                <input type="radio" name="reason-${d.id}" value="__other__" style="margin-right: 8px;">
+                                Other: <input type="text" id="reason-other-${d.id}" placeholder="Enter custom reason..." style="padding: 4px 8px; width: 300px;">
+                            </label>
+                        </div>
+                        <div style="margin-top: 10px;">
+                            <label style="color: #888; font-size: 0.9em;">Note (optional):</label>
+                            <textarea id="note-${d.id}" placeholder="Add any additional notes..." style="width: 100%; margin-top: 4px; padding: 8px; min-height: 60px;"></textarea>
+                        </div>
+                        <button onclick="confirmDecision(${d.id})" style="margin-top: 10px; padding: 8px 20px; background: #4ad9a0;">Confirm Decision</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderConfirmedDecision(d) {
+            return `
+                <div class="card" style="margin-bottom: 10px; border-left: 3px solid #4ad9a0;">
+                    <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                        <div style="flex: 1;">
+                            <div style="font-weight: bold; color: #00d9ff; margin-bottom: 4px;">${escapeHtml(d.problem)}</div>
+                            <div style="color: #4ad9a0; margin-bottom: 4px;">→ ${escapeHtml(d.solution)}</div>
+                            ${d.reason ? `<div style="color: #d9a04a; font-size: 0.9em;">Reason: ${escapeHtml(d.reason)}</div>` : ''}
+                            ${d.note ? `<div style="color: #888; font-size: 0.85em; margin-top: 4px; font-style: italic;">Note: ${escapeHtml(d.note)}</div>` : ''}
+                        </div>
+                        <span style="color: #666; font-size: 0.8em; white-space: nowrap;">${new Date(d.timestamp).toLocaleDateString()}</span>
+                    </div>
+                </div>
+            `;
+        }
+
+        async function confirmDecision(id) {
+            const selectedRadio = document.querySelector(`input[name="reason-${id}"]:checked`);
+            if (!selectedRadio) {
+                alert('Please select a reason');
+                return;
+            }
+
+            let reason = selectedRadio.value;
+            if (reason === '__other__') {
+                reason = document.getElementById(`reason-other-${id}`).value.trim();
+                if (!reason) {
+                    alert('Please enter a custom reason');
+                    return;
+                }
+            }
+
+            const note = document.getElementById(`note-${id}`).value.trim();
+
+            try {
+                const res = await fetch(`/api/projects/${currentProject}/decisions/${id}`, {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({status: 'confirmed', reason, note})
+                });
+                if (res.ok) {
+                    loadDecisions();
+                } else {
+                    alert('Failed to confirm decision');
+                }
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+        }
+
+        async function skipDecision(id) {
+            try {
+                const res = await fetch(`/api/projects/${currentProject}/decisions/${id}`, {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({status: 'skipped'})
+                });
+                if (res.ok) {
+                    loadDecisions();
+                }
+            } catch (e) {
+                console.error('Error skipping decision:', e);
+            }
+        }
+
+        async function deleteDecision(id) {
+            if (!confirm('Delete this decision?')) return;
+            try {
+                const res = await fetch(`/api/projects/${currentProject}/decisions/${id}`, {method: 'DELETE'});
+                if (res.ok) {
+                    loadDecisions();
+                }
+            } catch (e) {
+                console.error('Error deleting decision:', e);
+            }
+        }
+
+        function filterDecisions(status) {
+            currentDecisionFilter = status;
+            // Update button styles
+            document.getElementById('filter-pending-btn').style.background = status === 'pending' ? '#e94560' : '#333';
+            document.getElementById('filter-confirmed-btn').style.background = status === 'confirmed' ? '#4ad9a0' : '#333';
+            document.getElementById('filter-all-btn').style.background = status === '' ? '#4a90d9' : '#333';
+            loadDecisions();
+        }
+
+        function searchDecisionsDebounced() {
+            clearTimeout(searchDecisionsTimeout);
+            searchDecisionsTimeout = setTimeout(searchDecisions, 300);
+        }
+
+        async function searchDecisions() {
+            const query = document.getElementById('decision-search').value.trim();
+            if (!query || !currentProject) {
+                loadDecisions();
+                return;
+            }
+
+            try {
+                const res = await fetch(`/api/projects/${currentProject}/decisions/search?q=${encodeURIComponent(query)}`);
+                const data = await res.json();
+
+                document.getElementById('pending-decisions-list').innerHTML = '<div style="color: #888; padding: 10px;">Search results:</div>';
+                document.getElementById('confirmed-decisions-list').innerHTML = data.decisions.length > 0
+                    ? data.decisions.map(d => renderConfirmedDecision(d)).join('')
+                    : '<div style="color: #888; padding: 10px;">No matching decisions</div>';
+            } catch (e) {
+                console.error('Search error:', e);
+            }
         }
 
         // 加载应用配置

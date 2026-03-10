@@ -1,5 +1,9 @@
 from abc import ABC, abstractmethod
+import time
 from loguru import logger
+
+MAX_RETRIES = 3
+RETRY_DELAYS = [2, 5, 10]  # 秒
 
 
 class LLMClient(ABC):
@@ -24,20 +28,30 @@ class OllamaClient(LLMClient):
         from ollama import Client
         logger.debug(f"OllamaClient.generate: prompt_length={len(prompt)}")
         logger.debug(f"Calling Ollama chat API with model={self.model}, keep_alive={self.keep_alive}")
-        try:
-            client = Client(host=self.base_url, timeout=self.timeout)
-            response = client.chat(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                keep_alive=self.keep_alive,
-            )
-            result = response["message"]["content"]
-            logger.info(f"Ollama response received: length={len(result)}")
-            logger.debug(f"Ollama response preview: {result[:200]}...")
-            return result
-        except Exception as e:
-            logger.error(f"Ollama API error: {e}")
-            raise
+
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                client = Client(host=self.base_url, timeout=self.timeout)
+                response = client.chat(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    keep_alive=self.keep_alive,
+                )
+                result = response["message"]["content"]
+                logger.info(f"Ollama response received: length={len(result)}")
+                logger.debug(f"Ollama response preview: {result[:200]}...")
+                return result
+            except Exception as e:
+                last_error = e
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_DELAYS[attempt]
+                    logger.warning(f"Ollama API error (attempt {attempt + 1}/{MAX_RETRIES}): {e}, retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Ollama API error (all {MAX_RETRIES} attempts failed): {e}")
+
+        raise last_error
 
 
 class AnthropicClient(LLMClient):
@@ -50,19 +64,29 @@ class AnthropicClient(LLMClient):
     def generate(self, prompt: str) -> str:
         logger.debug(f"AnthropicClient.generate: prompt_length={len(prompt)}")
         logger.debug("Sending request to Anthropic API")
-        try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=2048,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            result = response.content[0].text
-            logger.info(f"Anthropic response received: length={len(result)}")
-            logger.debug(f"Anthropic response preview: {result[:200]}...")
-            return result
-        except Exception as e:
-            logger.error(f"Anthropic API error: {e}")
-            raise
+
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=2048,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                result = response.content[0].text
+                logger.info(f"Anthropic response received: length={len(result)}")
+                logger.debug(f"Anthropic response preview: {result[:200]}...")
+                return result
+            except Exception as e:
+                last_error = e
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_DELAYS[attempt]
+                    logger.warning(f"Anthropic API error (attempt {attempt + 1}/{MAX_RETRIES}): {e}, retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Anthropic API error (all {MAX_RETRIES} attempts failed): {e}")
+
+        raise last_error
 
 
 def create_llm_client(

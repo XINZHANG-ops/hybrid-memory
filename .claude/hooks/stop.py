@@ -442,44 +442,37 @@ def main():
         finalize_pending_permissions(Database(project_db), session_id)
         finalize_pending_permissions(Database(GLOBAL_DB), global_session_id)
 
-        # 5. 检查是否需要触发后台总结（达到阈值时）
-        should_summarize = project_manager.long_term.should_summarize(session_id)
-        if should_summarize and stop_reason != "end_session":
-            logger.info("Summary threshold reached, starting background summary process")
-            publish_event("summary", f"Threshold reached, starting background summary", project_name)
+        # 5. 总是启动后台进程（embedding + 可选的总结/知识提取）
+        background_script = Path(__file__).parent / "background_summary.py"
+        if background_script.exists():
+            should_summarize = project_manager.long_term.should_summarize(session_id)
+            is_end_session = stop_reason == "end_session"
 
-            background_script = Path(__file__).parent / "background_summary.py"
-            if background_script.exists():
-                cmd = [sys.executable, str(background_script), project_name, session_id, str(project_db), str(GLOBAL_DB), "--no-end-session"]
-                try:
-                    if sys.platform == "win32":
-                        subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
-                    else:
-                        subprocess.Popen(cmd, start_new_session=True)
-                    logger.info(f"Background summary process started")
-                except Exception as e:
-                    logger.error(f"Failed to start background summary process: {e}")
+            # 构建命令参数
+            cmd = [sys.executable, str(background_script), project_name, session_id, str(project_db), str(GLOBAL_DB)]
+            if not is_end_session:
+                cmd.append("--no-end-session")
+            if not should_summarize and not is_end_session:
+                cmd.append("--embedding-only")
 
-        # 处理会话结束（在后台子进程执行，避免阻塞 hook）
-        if stop_reason == "end_session":
-            logger.info("End session requested, starting background process")
-            publish_event("session_end", f"Session ending: {project_name}", "Starting background summary & knowledge extraction")
-
-            background_script = Path(__file__).parent / "background_summary.py"
-            if background_script.exists():
-                # 使用与 hook 相同的 Python 解释器
-                cmd = [sys.executable, str(background_script), project_name, session_id, str(project_db), str(GLOBAL_DB)]
-                try:
-                    # 启动独立进程，不等待完成
-                    if sys.platform == "win32":
-                        subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
-                    else:
-                        subprocess.Popen(cmd, start_new_session=True)
-                    logger.info(f"Background summary process started: {' '.join(cmd)}")
-                except Exception as e:
-                    logger.error(f"Failed to start background process: {e}")
+            # 日志和事件
+            if is_end_session:
+                logger.info("End session requested, starting background process")
+                publish_event("session_end", f"Session ending", project_name)
+            elif should_summarize:
+                logger.info("Summary threshold reached, starting background process")
+                publish_event("summary", f"Starting background summary", project_name)
             else:
-                logger.warning(f"Background script not found: {background_script}")
+                logger.debug("Starting background process for embedding")
+
+            try:
+                if sys.platform == "win32":
+                    subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
+                else:
+                    subprocess.Popen(cmd, start_new_session=True)
+                logger.info(f"Background process started")
+            except Exception as e:
+                logger.error(f"Failed to start background process: {e}")
 
     except Exception as e:
         logger.error(f"Error: {e}")

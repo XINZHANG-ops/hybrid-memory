@@ -27,12 +27,12 @@ DEFAULT_CONFIG = {
     "inject_recent_count": "5",
     "inject_knowledge_count": "5",
     "inject_task_count": "3",
+    "inject_decision_count": "5",
     # 总结管理配置
     "selected_summary_ids": "{}",  # JSON: {"project_name": [1, 3, 5], ...}
     "summary_prompt_template": "",  # 空=使用默认模板
     # 知识提取 Prompt
     "knowledge_extraction_prompt": "",  # 空=使用默认模板
-    "knowledge_condense_prompt": "",  # 空=使用默认模板
     # 总结生成配置
     "summary_max_chars_total": "8000",
     # 内容处理配置（用于总结、知识提取、历史注入等）
@@ -44,7 +44,6 @@ DEFAULT_CONFIG = {
     "content_max_chars_text": "500",
     # 知识提取配置
     "knowledge_max_items_per_category": "10",
-    "knowledge_auto_condense": "true",
     # 搜索结果配置
     "search_result_preview_length": "500",
     # Dashboard 刷新配置
@@ -213,6 +212,15 @@ CONFIG_META = {
         "max": 10,
         "group": "Inject",
     },
+    "inject_decision_count": {
+        "label": "注入决策数量",
+        "description": "会话启动时注入的决策记录数量",
+        "tooltip": "注入最近确认的微决策记录数量。决策记录包含问题、解决方案和原因，帮助 Claude 理解之前的技术决策。影响模块：sessionStart hook",
+        "type": "number",
+        "min": 0,
+        "max": 20,
+        "group": "Inject",
+    },
     "summary_prompt_template": {
         "label": "自定义总结 Prompt",
         "description": "自定义总结生成的 prompt 模板",
@@ -224,13 +232,6 @@ CONFIG_META = {
         "label": "知识提取 Prompt",
         "description": "自定义知识提取的 prompt 模板",
         "tooltip": "可用变量：{existing_knowledge}（已有知识）、{conversation}（当前对话）。留空则使用系统默认模板。输出需为 JSON 格式，包含 user_preferences、project_decisions、key_facts、pending_tasks、learned_patterns、important_context 六个数组字段。",
-        "type": "textarea",
-        "group": "Advanced",
-    },
-    "knowledge_condense_prompt": {
-        "label": "知识精炼 Prompt",
-        "description": "自定义知识精炼的 prompt 模板",
-        "tooltip": "可用变量：{category_name}（类别名称）、{count}（当前条目数）、{items}（条目列表）、{max_count}（目标条目数）。留空则使用系统默认模板。用于将过多的知识条目精炼合并。",
         "type": "textarea",
         "group": "Advanced",
     },
@@ -248,18 +249,10 @@ CONFIG_META = {
     "knowledge_max_items_per_category": {
         "label": "每类知识最大条目数",
         "description": "每个知识类别的条目数上限",
-        "tooltip": "每个知识类别（用户偏好、项目决策、关键事实等）最多保留多少条。当条目数超过此限制时：如果 knowledge_auto_condense=true，会调用 LLM 将多条合并精炼为更少的条目；否则简单保留最新的条目。",
+        "tooltip": "每个知识类别（用户偏好、项目决策、关键事实等）最多保留多少条。LLM 在提取知识时会直接融合旧知识与新对话，输出指定数量的条目。",
         "type": "number",
         "min": 3,
         "max": 50,
-        "group": "Knowledge",
-    },
-    "knowledge_auto_condense": {
-        "label": "自动精炼知识",
-        "description": "条目过多时是否自动调用 LLM 精炼",
-        "tooltip": "当某个知识类别的条目数超过 knowledge_max_items_per_category 时，如果启用此选项，会调用 LLM 将条目合并精炼（例如将 20 条相似的偏好合并为 10 条）。这样可以保留更多有价值的信息。缺点是会消耗额外 token。关闭则简单截断。",
-        "type": "select",
-        "options": ["true", "false"],
         "group": "Knowledge",
     },
     # 内容处理配置
@@ -407,7 +400,6 @@ class ConfigManager:
             # Prompt 模板
             "summary_prompt_template": self.get("summary_prompt_template"),
             "knowledge_extraction_prompt": self.get("knowledge_extraction_prompt"),
-            "knowledge_condense_prompt": self.get("knowledge_condense_prompt"),
         }
 
 

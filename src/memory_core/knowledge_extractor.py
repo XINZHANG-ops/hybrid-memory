@@ -2,7 +2,7 @@ import json
 from loguru import logger
 from .models import Message
 from .llm_client import LLMClient
-from .prompts import EXTRACTION_PROMPT, CONDENSE_PROMPT, CATEGORY_NAMES, ROLE_LABELS, UI_TEXT
+from .prompts import EXTRACTION_PROMPT, CATEGORY_NAMES, ROLE_LABELS, UI_TEXT
 from .content_processor import ContentConfig, process_content
 
 
@@ -12,17 +12,21 @@ class KnowledgeExtractor:
         llm_client: LLMClient,
         content_config: ContentConfig | None = None,
         extraction_prompt: str = "",
-        condense_prompt: str = "",
+        max_items_per_category: int = 10,
     ):
         self.llm = llm_client
         self.content_config = content_config or ContentConfig()
         self.extraction_prompt = extraction_prompt
-        self.condense_prompt = condense_prompt
-        logger.info(f"KnowledgeExtractor initialized (content_config={self.content_config})")
+        self.max_items = max_items_per_category
+        logger.info(f"KnowledgeExtractor initialized (max_items={self.max_items}, content_config={self.content_config})")
 
     def extract(self, messages: list[Message], existing_knowledge: dict | None = None) -> dict:
+        """
+        从对话中提取知识，与已有知识融合。
+        LLM 直接输出融合后的完整知识库（每类最多 max_items 条）。
+        """
         if not messages:
-            return self._empty_knowledge()
+            return existing_knowledge or self._empty_knowledge()
 
         conversation = self._format_conversation(messages)
         existing_str = self._format_existing_knowledge(existing_knowledge)
@@ -31,23 +35,36 @@ class KnowledgeExtractor:
             try:
                 prompt = self.extraction_prompt.format(
                     conversation=conversation,
-                    existing_knowledge=existing_str
+                    existing_knowledge=existing_str,
+                    max_items=self.max_items
                 )
                 logger.debug("Using custom extraction prompt")
             except KeyError as e:
                 logger.warning(f"Custom extraction prompt format error: {e}, falling back to default")
-                prompt = EXTRACTION_PROMPT.format(conversation=conversation, existing_knowledge=existing_str)
+                prompt = EXTRACTION_PROMPT.format(
+                    conversation=conversation,
+                    existing_knowledge=existing_str,
+                    max_items=self.max_items
+                )
         else:
-            prompt = EXTRACTION_PROMPT.format(conversation=conversation, existing_knowledge=existing_str)
+            prompt = EXTRACTION_PROMPT.format(
+                conversation=conversation,
+                existing_knowledge=existing_str,
+                max_items=self.max_items
+            )
 
         try:
             response = self.llm.generate(prompt)
             knowledge = self._parse_response(response)
+            # 确保每类不超过 max_items
+            for key in knowledge:
+                if len(knowledge[key]) > self.max_items:
+                    knowledge[key] = knowledge[key][:self.max_items]
             logger.info(f"Extracted knowledge: {sum(len(v) for v in knowledge.values())} items")
             return knowledge
         except Exception as e:
             logger.error(f"Knowledge extraction failed: {e}")
-            return self._empty_knowledge()
+            return existing_knowledge or self._empty_knowledge()
 
     def _format_existing_knowledge(self, knowledge: dict | None) -> str:
         no_knowledge_text = UI_TEXT.get("no_existing_knowledge", "(No existing knowledge)")
@@ -119,48 +136,3 @@ class KnowledgeExtractor:
         logger.debug(f"Merged knowledge: {sum(len(v) for v in merged.values())} total items")
         return merged
 
-    def condense_knowledge(self, knowledge: dict, max_per_category: int = 10) -> dict:
-        """当知识条目过多时，使用 LLM 精炼每个类别"""
-        condensed = {}
-        for key, items in knowledge.items():
-            if len(items) <= max_per_category:
-                condensed[key] = items
-                continue
-
-            # 需要精炼
-            logger.info(f"Condensing {key}: {len(items)} -> {max_per_category}")
-            prompt_template = self.condense_prompt if self.condense_prompt and self.condense_prompt.strip() else CONDENSE_PROMPT
-            try:
-                prompt = prompt_template.format(
-                    category_name=CATEGORY_NAMES.get(key, key),
-                    count=len(items),
-                    items="\n".join(f"- {item}" for item in items),
-                    max_count=max_per_category,
-                )
-            except KeyError as e:
-                logger.warning(f"Custom condense prompt format error: {e}, falling back to default")
-                prompt = CONDENSE_PROMPT.format(
-                    category_name=CATEGORY_NAMES.get(key, key),
-                    count=len(items),
-                    items="\n".join(f"- {item}" for item in items),
-                    max_count=max_per_category,
-                )
-
-            try:
-                response = self.llm.generate(prompt)
-                # 解析 JSON 数组
-                response = response.strip()
-                if response.startswith("```"):
-                    lines = response.split("\n")
-                    response = "\n".join(lines[1:-1])
-                new_items = json.loads(response)
-                if isinstance(new_items, list):
-                    condensed[key] = new_items[:max_per_category]
-                    logger.info(f"Condensed {key}: {len(items)} -> {len(condensed[key])}")
-                else:
-                    condensed[key] = items[:max_per_category]
-            except Exception as e:
-                logger.warning(f"Failed to condense {key}: {e}")
-                condensed[key] = items[:max_per_category]
-
-        return condensed
