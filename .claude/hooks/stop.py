@@ -361,14 +361,19 @@ def main():
     session_id = input_data.get("session_id") or f"{project_name}-session"
     stop_reason = input_data.get("stop_reason", "")
 
-    # 优先使用 last_assistant_message（Claude Code 直接提供）
-    response = input_data.get("last_assistant_message", "")
+    # 优先从 transcript 提取结构化格式（包含 thinking、tool、text 块）
     transcript_path = input_data.get("transcript_path", "")
+    response = ""
 
-    # 如果没有，尝试从 transcript 提取
-    if not response and transcript_path:
-        logger.info(f"No last_assistant_message, extracting from transcript: {transcript_path}")
+    if transcript_path:
+        logger.info(f"Extracting structured response from transcript: {transcript_path}")
         response = extract_assistant_response_from_transcript(transcript_path)
+
+    # 如果 transcript 提取失败，使用 last_assistant_message（纯文本）
+    if not response:
+        response = input_data.get("last_assistant_message", "")
+        if response:
+            logger.info(f"Using last_assistant_message as fallback (plain text, {len(response)} chars)")
 
     logger.info(f"Project: {project_name}, Session: {session_id}")
     logger.info(f"Stop reason: {stop_reason}, Response length: {len(response)}")
