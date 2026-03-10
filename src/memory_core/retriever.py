@@ -1,4 +1,3 @@
-import re
 from loguru import logger
 from .database import Database
 from .models import Message

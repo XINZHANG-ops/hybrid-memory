@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from flask import Flask, jsonify, request, Response
+from flask import Flask, request, Response
 import json
 from loguru import logger
 

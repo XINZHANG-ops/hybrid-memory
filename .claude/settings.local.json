@@ -48,7 +48,10 @@
       "Bash(cmd //c \"del /f /q \"\"\\\\\\\\?\\\\D:\\\\python\\\\hybrid-memory\\\\nul\"\"\")",
       "Bash(Select-Object -Last 50)",
       "Bash(node --check:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(.venvScriptspython -m py_compile src/memory_core/hook_utils.py .claude/hooks/userPromptSubmit.py .claude/hooks/stop.py .claude/hooks/sessionStart.py .claude/hooks/permissionRequest.py .claude/hooks/postToolUse.py .claude/hooks/background_summary.py src/memory_core/retriever.py src/http_api/dashboard.py)",
+      "Bash(D:pythonhybrid-memory.venvScriptspython.exe -m py_compile D:pythonhybrid-memorysrcmemory_corehook_utils.py D:pythonhybrid-memory.claudehooksuserPromptSubmit.py D:pythonhybrid-memory.claudehooksstop.py D:pythonhybrid-memory.claudehookssessionStart.py D:pythonhybrid-memory.claudehookspermissionRequest.py D:pythonhybrid-memory.claudehookspostToolUse.py D:pythonhybrid-memory.claudehooksbackground_summary.py D:pythonhybrid-memorysrcmemory_coreretriever.py D:pythonhybrid-memorysrchttp_apidashboard.py)",
+      "Bash(wc:*)"
     ]
   }
 }

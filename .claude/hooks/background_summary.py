@@ -7,42 +7,36 @@ Background Summary Script - 后台执行总结和知识提取
 import sys
 from pathlib import Path
 
-# 添加项目根目录到 path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from loguru import logger
-from src.memory_core import MemoryManager, publish_event, DecisionExtractor, Decision
+from src.memory_core import MemoryManager, publish_event, DecisionExtractor
 from src.memory_core.config import load_config
 from src.memory_core.database import Database
 from src.memory_core.llm_client import create_llm_client
-
-# 路径配置
-MEMORY_BASE = Path(__file__).parent.parent.parent / "data"
-LOG_FILE = MEMORY_BASE / "hooks.log"
-MEMORY_BASE.mkdir(parents=True, exist_ok=True)
+from src.memory_core.content_processor import ContentConfig
+from src.memory_core.hook_utils import MEMORY_BASE, LOG_FILE
 
 # 配置日志
 logger.remove()
+MEMORY_BASE.mkdir(parents=True, exist_ok=True)
 logger.add(LOG_FILE, level="DEBUG", rotation="1 MB", retention="1 hour")
 
 
 def extract_decisions(project_name: str, session_id: str, project_db: Path, config_mgr):
-    """从最近的对话中提取决策（可能多个或零个）"""
+    """从最近的对话中提取决策"""
     logger.info(f"[Background] Extracting decisions for {project_name}")
     publish_event("decision", "Extracting decisions from conversation", project_name)
 
     db = Database(project_db)
 
-    # 获取未进行决策提取的消息
     messages = db.get_messages_for_decision(None)
     if len(messages) < 3:
         logger.info("[Background] Not enough messages for decision extraction")
         return
 
-    # 转换为简单格式
     msg_list = [{"role": m.role, "content": m.content} for m in messages]
 
-    # 创建 LLM 客户端
     llm_client = create_llm_client(
         provider=config_mgr.get("llm_provider"),
         ollama_model=config_mgr.get("ollama_model"),
@@ -51,8 +45,6 @@ def extract_decisions(project_name: str, session_id: str, project_db: Path, conf
         ollama_keep_alive=config_mgr.get("ollama_keep_alive"),
     )
 
-    # 创建内容处理配置
-    from src.memory_core.content_processor import ContentConfig
     content_config = ContentConfig(
         include_thinking=config_mgr.get("content_include_thinking") == "true",
         include_tool=config_mgr.get("content_include_tool") == "true",
@@ -62,15 +54,12 @@ def extract_decisions(project_name: str, session_id: str, project_db: Path, conf
         max_chars_text=int(config_mgr.get("content_max_chars_text") or 500),
     )
 
-    # 获取消息 ID 列表
     message_ids = [m.id for m in messages if m.id]
 
-    # 提取决策（传入消息 ID 以记录范围）
     decision_prompt = config_mgr.get("decision_extraction_prompt") or ""
     extractor = DecisionExtractor(llm_client, content_config, decision_prompt)
     decisions = extractor.extract_decisions(msg_list, project_name, session_id, message_ids=message_ids)
 
-    # 标记消息为已决策提取
     if message_ids:
         db.mark_messages_decision_extracted(message_ids)
 
@@ -104,7 +93,6 @@ def main():
         logger.info(f"[Background] Starting end_session for project={project_name}, session={session_id}")
 
     try:
-        # 加载配置
         config_mgr = load_config(global_db)
         config_kwargs = config_mgr.get_memory_manager_kwargs()
 
@@ -113,7 +101,6 @@ def main():
 
         if not embedding_only:
             if no_end_session:
-                # 只触发总结，不结束会话
                 project_summary = project_manager.trigger_summary(session_id)
                 if project_summary:
                     logger.info(f"[Background][Project] Summary created: id={project_summary.id}")
@@ -127,7 +114,6 @@ def main():
                 else:
                     logger.info(f"[Background][Global] No summary needed")
             else:
-                # 结束会话（包含总结）
                 project_summary = project_manager.end_session(session_id)
                 if project_summary:
                     logger.info(f"[Background][Project] Session ended with summary: id={project_summary.id}")
@@ -141,7 +127,7 @@ def main():
                 else:
                     logger.info(f"[Background][Global] Session ended without summary")
 
-        # 补充执行 embedding（hook 中跳过的）
+        # 补充执行 embedding
         try:
             project_indexed = project_manager.index_pending_messages()
             global_indexed = global_manager.index_pending_messages()
@@ -150,7 +136,7 @@ def main():
         except Exception as e:
             logger.error(f"[Background] Embedding error: {e}")
 
-        # 决策提取（在总结或会话结束时触发，非 embedding-only）
+        # 决策提取
         if not embedding_only:
             try:
                 extract_decisions(project_name, session_id, project_db, config_mgr)

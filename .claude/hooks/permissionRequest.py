@@ -9,7 +9,6 @@ PermissionRequest Hook - 记录权限请求交互
 """
 import sys
 import json
-import os
 from pathlib import Path
 from datetime import datetime
 
@@ -17,38 +16,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from loguru import logger
 from src.memory_core import Database, Interaction
+from src.memory_core.hook_utils import (
+    GLOBAL_DB, setup_hook_logger, configure_utf8_stdio,
+    get_project_name, get_project_db_path
+)
 
-# 路径配置
-MEMORY_BASE = Path(__file__).parent.parent.parent / "data"
-GLOBAL_DB = MEMORY_BASE / "global_memory.db"
-PROJECTS_DIR = MEMORY_BASE / "projects"
-
-LOG_FILE = MEMORY_BASE / "hooks.log"
-MEMORY_BASE.mkdir(parents=True, exist_ok=True)
-
-# 移除默认的 stderr handler，只输出到文件
-logger.remove()
-PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
-logger.add(LOG_FILE, level="DEBUG", rotation="1 MB", retention="1 hour")
-
-
-def get_project_name() -> str:
-    cwd = os.getcwd()
-    return Path(cwd).name
-
-
-def get_project_db_path(project_name: str) -> Path:
-    return PROJECTS_DIR / f"{project_name}.db"
+setup_hook_logger()
 
 
 def main():
     logger.info("Hook permissionRequest triggered")
-
-    # Windows UTF-8 fix
-    if hasattr(sys.stdin, 'reconfigure'):
-        sys.stdin.reconfigure(encoding='utf-8', errors='replace')
-    if hasattr(sys.stdout, 'reconfigure'):
-        sys.stdout.reconfigure(encoding='utf-8')
+    configure_utf8_stdio()
 
     try:
         raw_input = sys.stdin.read()
@@ -63,18 +41,15 @@ def main():
     project_name = get_project_name()
     session_id = input_data.get("session_id") or f"{project_name}-session"
 
-    # 提取权限请求信息
     tool_name = input_data.get("tool_name", "") or input_data.get("tool", "")
 
-    # 尝试从不同字段获取请求内容
+    # 提取请求内容
     request_content = ""
     if "tool_input" in input_data:
         tool_input = input_data["tool_input"]
         if isinstance(tool_input, dict):
-            # 对于 Bash 工具，提取 command
             if tool_name == "Bash":
                 request_content = tool_input.get("command", "")
-            # 对于 Edit/Write 工具，提取 file_path
             elif tool_name in ("Edit", "Write"):
                 request_content = tool_input.get("file_path", "")
             else:
@@ -89,7 +64,6 @@ def main():
     logger.info(f"Permission request: tool={tool_name}, content={request_content[:100]}...")
 
     try:
-        # 记录到项目数据库
         project_db = get_project_db_path(project_name)
         db = Database(project_db)
 
@@ -100,7 +74,7 @@ def main():
             tool_name=tool_name,
             request_content=request_content,
             options="",
-            user_response="pending",  # 将在用户响应后更新
+            user_response="pending",
             timestamp=datetime.now()
         )
 
@@ -118,7 +92,6 @@ def main():
         import traceback
         logger.error(traceback.format_exc())
 
-    # 不干预用户决定，继续正常流程
     print(json.dumps({"continue": True}))
 
 
