@@ -243,17 +243,26 @@ class MemoryManager:
         # 在总结前提取知识（LLM 直接融合旧知识+新对话，输出完整知识库）
         if self.enable_knowledge_extraction and self.knowledge_extractor:
             try:
-                publish_event("knowledge", f"{source_tag} Extracting knowledge from {len(messages)} msgs", "Sending to LLM...")
-                existing_knowledge = self.db.get_knowledge()
-                knowledge = self.knowledge_extractor.extract(messages, existing_knowledge)
-                if knowledge:
-                    # 直接保存（覆盖旧知识）
-                    with self.db._connect() as conn:
-                        conn.execute("DELETE FROM knowledge")
-                    self.db.save_knowledge(session_id, knowledge)
-                    total_items = sum(len(v) for v in knowledge.values())
-                    logger.info(f"Knowledge updated: {total_items} items")
-                    publish_event("knowledge_done", f"{source_tag} Updated: {total_items} items", "")
+                # 获取未进行知识提取的消息（独立于总结计数）
+                knowledge_messages = self.db.get_messages_for_knowledge(None)
+                if knowledge_messages:
+                    publish_event("knowledge", f"{source_tag} Extracting knowledge from {len(knowledge_messages)} msgs", "Sending to LLM...")
+                    existing_knowledge = self.db.get_knowledge()
+                    knowledge = self.knowledge_extractor.extract(knowledge_messages, existing_knowledge)
+                    if knowledge:
+                        # 保存知识历史版本
+                        self.db.save_knowledge_history(session_id, knowledge)
+                        # 直接保存（覆盖旧知识）
+                        with self.db._connect() as conn:
+                            conn.execute("DELETE FROM knowledge")
+                        self.db.save_knowledge(session_id, knowledge)
+                        # 标记消息为已知识提取
+                        message_ids = [m.id for m in knowledge_messages if m.id]
+                        if message_ids:
+                            self.db.mark_messages_knowledge_extracted(message_ids)
+                        total_items = sum(len(v) for v in knowledge.values())
+                        logger.info(f"Knowledge updated: {total_items} items")
+                        publish_event("knowledge_done", f"{source_tag} Updated: {total_items} items", "")
             except Exception as e:
                 logger.warning(f"Knowledge extraction during summary failed: {e}")
                 publish_event("error", f"{source_tag} Knowledge extraction failed: {e}", "")
@@ -310,10 +319,8 @@ class MemoryManager:
             logger.warning("Knowledge extraction not available")
             return {}
 
-        messages = self.db.get_unsummarized_messages(session_id)
-        if not messages:
-            messages = self.short_term.get_recent(session_id)
-
+        # 获取未进行知识提取的消息
+        messages = self.db.get_messages_for_knowledge(session_id)
         if not messages:
             return self.knowledge_extractor._empty_knowledge()
 
@@ -321,10 +328,16 @@ class MemoryManager:
         existing_knowledge = self.db.get_knowledge()
         knowledge = self.knowledge_extractor.extract(messages, existing_knowledge)
 
+        # 保存知识历史版本
+        self.db.save_knowledge_history(session_id, knowledge)
         # 直接保存（覆盖旧知识）
         with self.db._connect() as conn:
             conn.execute("DELETE FROM knowledge")
         self.db.save_knowledge(session_id, knowledge)
+        # 标记消息为已知识提取
+        message_ids = [m.id for m in messages if m.id]
+        if message_ids:
+            self.db.mark_messages_knowledge_extracted(message_ids)
         return knowledge
 
     def get_knowledge(self, session_id: str | None = None) -> dict:

@@ -26,15 +26,15 @@ logger.remove()
 logger.add(LOG_FILE, level="DEBUG", rotation="1 MB", retention="1 hour")
 
 
-def extract_decision(project_name: str, session_id: str, project_db: Path, config_mgr):
-    """从最近的对话中提取决策"""
-    logger.info(f"[Background] Extracting decision for {project_name}")
-    publish_event("decision", "Extracting decision from conversation", project_name)
+def extract_decisions(project_name: str, session_id: str, project_db: Path, config_mgr):
+    """从最近的对话中提取决策（可能多个或零个）"""
+    logger.info(f"[Background] Extracting decisions for {project_name}")
+    publish_event("decision", "Extracting decisions from conversation", project_name)
 
     db = Database(project_db)
 
-    # 获取最近的消息
-    messages = db.get_messages(session_id, limit=20)
+    # 获取未进行决策提取的消息
+    messages = db.get_messages_for_decision(None)
     if len(messages) < 3:
         logger.info("[Background] Not enough messages for decision extraction")
         return
@@ -51,16 +51,34 @@ def extract_decision(project_name: str, session_id: str, project_db: Path, confi
         ollama_keep_alive=config_mgr.get("ollama_keep_alive"),
     )
 
-    # 提取决策
-    extractor = DecisionExtractor(llm_client)
-    decision = extractor.extract_decision(msg_list, project_name, session_id)
+    # 创建内容处理配置
+    from src.memory_core.content_processor import ContentConfig
+    content_config = ContentConfig(
+        include_thinking=config_mgr.get("content_include_thinking") == "true",
+        include_tool=config_mgr.get("content_include_tool") == "true",
+        include_text=config_mgr.get("content_include_text") == "true",
+        max_chars_thinking=int(config_mgr.get("content_max_chars_thinking") or 200),
+        max_chars_tool=int(config_mgr.get("content_max_chars_tool") or 300),
+        max_chars_text=int(config_mgr.get("content_max_chars_text") or 500),
+    )
 
-    if decision:
-        db.add_decision(decision)
-        logger.info(f"[Background] Decision saved: {decision.problem[:50]}...")
-        publish_event("decision_done", f"Decision extracted: {decision.problem[:50]}...", project_name)
+    # 提取决策
+    decision_prompt = config_mgr.get("decision_extraction_prompt") or ""
+    extractor = DecisionExtractor(llm_client, content_config, decision_prompt)
+    decisions = extractor.extract_decisions(msg_list, project_name, session_id)
+
+    # 标记消息为已决策提取
+    message_ids = [m.id for m in messages if m.id]
+    if message_ids:
+        db.mark_messages_decision_extracted(message_ids)
+
+    if decisions:
+        for decision in decisions:
+            db.add_decision(decision)
+        logger.info(f"[Background] Saved {len(decisions)} decisions")
+        publish_event("decision_done", f"Extracted {len(decisions)} decisions", project_name)
     else:
-        logger.info("[Background] No decision detected in conversation")
+        logger.info("[Background] No decisions detected in conversation")
 
 
 def main():
@@ -133,7 +151,7 @@ def main():
         # 决策提取（在总结或会话结束时触发，非 embedding-only）
         if not embedding_only:
             try:
-                extract_decision(project_name, session_id, project_db, config_mgr)
+                extract_decisions(project_name, session_id, project_db, config_mgr)
             except Exception as e:
                 logger.error(f"[Background] Decision extraction error: {e}")
 

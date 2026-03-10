@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS messages (
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     token_count INTEGER DEFAULT 0,
     is_summarized BOOLEAN DEFAULT 0,
+    is_knowledge_extracted BOOLEAN DEFAULT 0,
+    is_decision_extracted BOOLEAN DEFAULT 0,
     model TEXT DEFAULT '',
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
@@ -103,6 +105,15 @@ CREATE INDEX IF NOT EXISTS idx_interactions_timestamp ON interactions(timestamp)
 CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project);
 CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status);
 CREATE INDEX IF NOT EXISTS idx_decisions_timestamp ON decisions(timestamp);
+
+CREATE TABLE IF NOT EXISTS knowledge_history (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT,
+    content TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_history_timestamp ON knowledge_history(created_at);
 """
 
 
@@ -124,6 +135,18 @@ class Database:
             except sqlite3.OperationalError:
                 logger.info("Migrating: adding model column to messages table")
                 conn.execute("ALTER TABLE messages ADD COLUMN model TEXT DEFAULT ''")
+            # Migration: add is_knowledge_extracted column
+            try:
+                conn.execute("SELECT is_knowledge_extracted FROM messages LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("Migrating: adding is_knowledge_extracted column to messages table")
+                conn.execute("ALTER TABLE messages ADD COLUMN is_knowledge_extracted BOOLEAN DEFAULT 0")
+            # Migration: add is_decision_extracted column
+            try:
+                conn.execute("SELECT is_decision_extracted FROM messages LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("Migrating: adding is_decision_extracted column to messages table")
+                conn.execute("ALTER TABLE messages ADD COLUMN is_decision_extracted BOOLEAN DEFAULT 0")
         logger.debug("Schema initialization complete")
 
     @contextmanager
@@ -208,18 +231,28 @@ class Database:
     def get_messages(
         self, session_id: str, include_summarized: bool = False, limit: int | None = None
     ) -> list[Message]:
+        """获取消息（按时间升序，旧消息在前）。limit 时获取最新的 N 条。"""
         logger.debug(f"Getting messages: session={session_id}, include_summarized={include_summarized}, limit={limit}")
         with self._connect() as conn:
             query = "SELECT * FROM messages WHERE session_id = ?"
             params: list = [session_id]
             if not include_summarized:
                 query += " AND is_summarized = 0"
-            query += " ORDER BY id ASC"
+
             if limit:
-                query += " LIMIT ?"
+                # 先按 DESC 获取最新 N 条
+                query += " ORDER BY id DESC LIMIT ?"
                 params.append(limit)
+            else:
+                query += " ORDER BY id ASC"
+
             rows = conn.execute(query, params).fetchall()
             messages = [self._row_to_message(row) for row in rows]
+
+            # 有 limit 时反转为时间升序
+            if limit:
+                messages.reverse()
+
             logger.debug(f"Retrieved {len(messages)} messages for session {session_id}")
             return messages
 
@@ -252,6 +285,64 @@ class Database:
                 message_ids,
             )
         logger.info(f"Marked {len(message_ids)} messages as summarized")
+
+    def get_messages_for_knowledge(self, session_id: str | None = None) -> list[Message]:
+        """获取未进行知识提取的消息"""
+        logger.debug(f"Getting messages for knowledge extraction: session={session_id}")
+        with self._connect() as conn:
+            if session_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM messages WHERE is_knowledge_extracted = 0 ORDER BY id ASC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ? AND is_knowledge_extracted = 0 ORDER BY id ASC",
+                    (session_id,),
+                ).fetchall()
+            messages = [self._row_to_message(row) for row in rows]
+            logger.debug(f"Retrieved {len(messages)} messages for knowledge extraction")
+            return messages
+
+    def mark_messages_knowledge_extracted(self, message_ids: list[int]):
+        if not message_ids:
+            return
+        logger.debug(f"Marking {len(message_ids)} messages as knowledge extracted")
+        with self._connect() as conn:
+            placeholders = ",".join("?" * len(message_ids))
+            conn.execute(
+                f"UPDATE messages SET is_knowledge_extracted = 1 WHERE id IN ({placeholders})",
+                message_ids,
+            )
+        logger.info(f"Marked {len(message_ids)} messages as knowledge extracted")
+
+    def get_messages_for_decision(self, session_id: str | None = None) -> list[Message]:
+        """获取未进行决策提取的消息"""
+        logger.debug(f"Getting messages for decision extraction: session={session_id}")
+        with self._connect() as conn:
+            if session_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM messages WHERE is_decision_extracted = 0 ORDER BY id ASC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ? AND is_decision_extracted = 0 ORDER BY id ASC",
+                    (session_id,),
+                ).fetchall()
+            messages = [self._row_to_message(row) for row in rows]
+            logger.debug(f"Retrieved {len(messages)} messages for decision extraction")
+            return messages
+
+    def mark_messages_decision_extracted(self, message_ids: list[int]):
+        if not message_ids:
+            return
+        logger.debug(f"Marking {len(message_ids)} messages as decision extracted")
+        with self._connect() as conn:
+            placeholders = ",".join("?" * len(message_ids))
+            conn.execute(
+                f"UPDATE messages SET is_decision_extracted = 1 WHERE id IN ({placeholders})",
+                message_ids,
+            )
+        logger.info(f"Marked {len(message_ids)} messages as decision extracted")
 
     def count_unsummarized_messages(self, session_id: str | None = None) -> int:
         """计数未总结消息。session_id=None 时统计所有 session"""
@@ -314,7 +405,7 @@ class Database:
             return summaries
 
     def get_recent_messages_all_sessions(self, limit: int = 20) -> list[Message]:
-        """获取所有会话的最近消息"""
+        """获取所有会话的最近消息（按时间升序，旧消息在前）"""
         logger.debug(f"Getting recent messages from all sessions: limit={limit}")
         with self._connect() as conn:
             rows = conn.execute(
@@ -322,6 +413,7 @@ class Database:
                 (limit,),
             ).fetchall()
             messages = [self._row_to_message(row) for row in rows]
+            messages.reverse()  # 反转为时间升序
             logger.debug(f"Retrieved {len(messages)} recent messages across all sessions")
             return messages
 
@@ -377,6 +469,7 @@ class Database:
             return messages
 
     def _row_to_message(self, row: sqlite3.Row) -> Message:
+        keys = row.keys()
         return Message(
             id=row["id"],
             session_id=row["session_id"],
@@ -385,7 +478,9 @@ class Database:
             timestamp=row["timestamp"] if isinstance(row["timestamp"], datetime) else datetime.fromisoformat(row["timestamp"]),
             token_count=row["token_count"],
             is_summarized=bool(row["is_summarized"]),
-            model=row["model"] if "model" in row.keys() else "",
+            is_knowledge_extracted=bool(row["is_knowledge_extracted"]) if "is_knowledge_extracted" in keys else False,
+            is_decision_extracted=bool(row["is_decision_extracted"]) if "is_decision_extracted" in keys else False,
+            model=row["model"] if "model" in keys else "",
         )
 
     def _row_to_summary(self, row: sqlite3.Row) -> Summary:
@@ -459,6 +554,37 @@ class Database:
                             (session_id, category, item)
                         )
         logger.info(f"Knowledge saved for session {session_id}")
+
+    def save_knowledge_history(self, session_id: str | None, knowledge: dict):
+        """保存知识历史版本"""
+        import json
+        logger.debug(f"Saving knowledge history for session: {session_id}")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO knowledge_history (session_id, content, created_at) VALUES (?, ?, ?)",
+                (session_id, json.dumps(knowledge, ensure_ascii=False), datetime.now())
+            )
+        logger.info(f"Knowledge history saved for session {session_id}")
+
+    def get_knowledge_history(self, limit: int = 20) -> list[dict]:
+        """获取知识历史版本"""
+        import json
+        logger.debug(f"Getting knowledge history: limit={limit}")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM knowledge_history ORDER BY created_at DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+            history = []
+            for row in rows:
+                history.append({
+                    "id": row["id"],
+                    "session_id": row["session_id"],
+                    "content": json.loads(row["content"]) if row["content"] else {},
+                    "created_at": row["created_at"].isoformat() if isinstance(row["created_at"], datetime) else row["created_at"],
+                })
+            logger.debug(f"Retrieved {len(history)} knowledge history records")
+            return history
 
     def get_knowledge(self, session_id: str | None = None) -> dict:
         logger.debug(f"Getting knowledge for session: {session_id}")
@@ -643,7 +769,7 @@ class Database:
             if status:
                 query += " AND status = ?"
                 params.append(status)
-            query += " ORDER BY timestamp DESC LIMIT ?"
+            query += " ORDER BY timestamp ASC LIMIT ?"
             params.append(limit)
             rows = conn.execute(query, params).fetchall()
             decisions = [self._row_to_decision(row) for row in rows]

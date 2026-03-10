@@ -688,14 +688,10 @@ def extract_knowledge(project_name):
 
     config_mgr = load_config(GLOBAL_DB)
 
-    # 获取最近的未总结消息
-    messages = db.get_unsummarized_messages()
+    # 获取未进行知识提取的消息
+    messages = db.get_messages_for_knowledge()
     if not messages:
-        # 如果没有未总结的，获取最近 20 条消息
-        messages = db.get_recent_messages_all_sessions(limit=20)
-
-    if not messages:
-        return json_response({"status": "ok", "message": "No messages to extract from", "extracted": {}})
+        return json_response({"status": "ok", "message": "No messages to extract from", "total": 0})
 
     publish_event("knowledge", f"Extracting knowledge from {len(messages)} messages", project_name)
 
@@ -725,15 +721,23 @@ def extract_knowledge(project_name):
     # 提取并融合知识（LLM 直接输出融合后的完整知识库）
     knowledge = extractor.extract(messages, existing)
 
+    # 保存知识历史版本
+    db.save_knowledge_history(None, knowledge)
+
     # 直接保存（覆盖旧知识）
     with db._connect() as conn:
         conn.execute("DELETE FROM knowledge")
     db.save_knowledge(None, knowledge)
 
+    # 标记消息为已知识提取
+    message_ids = [m.id for m in messages if m.id]
+    if message_ids:
+        db.mark_messages_knowledge_extracted(message_ids)
+
     total_items = sum(len(v) for v in knowledge.values())
     publish_event("knowledge_done", f"Knowledge updated: {total_items} items", project_name)
 
-    return json_response({"status": "ok", "extracted": new_knowledge, "total": merged})
+    return json_response({"status": "ok", "total": total_items})
 
 
 @app.route("/api/projects/<project_name>/knowledge-debug")
@@ -755,12 +759,9 @@ def get_knowledge_debug(project_name):
         max_chars_text=config_mgr.get_int("content_max_chars_text"),
     )
 
-    # 获取消息
-    messages = db.get_unsummarized_messages()
-    source = "unsummarized"
-    if not messages:
-        messages = db.get_recent_messages_all_sessions(limit=20)
-        source = "recent_20"
+    # 获取未进行知识提取的消息
+    messages = db.get_messages_for_knowledge()
+    source = "pending_knowledge"
 
     # 格式化对话（使用 content_processor，与 KnowledgeExtractor 一致）
     from src.memory_core.prompts import ROLE_LABELS, CATEGORY_NAMES, UI_TEXT
@@ -787,7 +788,8 @@ def get_knowledge_debug(project_name):
         existing_str = no_knowledge_text
 
     # 生成完整 prompt
-    prompt = EXTRACTION_PROMPT.format(conversation=conversation, existing_knowledge=existing_str)
+    max_items = config_mgr.get_int("knowledge_max_items_per_category")
+    prompt = EXTRACTION_PROMPT.format(conversation=conversation, existing_knowledge=existing_str, max_items=max_items)
 
     return json_response({
         "message_count": len(messages),
@@ -997,6 +999,126 @@ def search_decisions(project_name):
     })
 
 
+@app.route("/api/projects/<project_name>/decisions/extract", methods=["POST"])
+def extract_decisions(project_name):
+    """手动触发决策提取"""
+    from src.memory_core.events import publish_event
+    from src.memory_core.decision_extractor import DecisionExtractor
+    from src.memory_core.llm_client import create_llm_client
+    from src.memory_core.config import load_config
+
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+
+    db = Database(db_path)
+    config_mgr = load_config(GLOBAL_DB)
+
+    # 获取未进行决策提取的消息
+    messages = db.get_messages_for_decision(None)
+    if len(messages) < 3:
+        return json_response({"status": "ok", "message": "Not enough messages", "decisions": []})
+
+    publish_event("decision", f"Extracting decisions from {len(messages)} messages", project_name)
+
+    # 创建 LLM 客户端
+    llm_client = create_llm_client(
+        provider=config_mgr.get("llm_provider"),
+        ollama_model=config_mgr.get("ollama_model"),
+        ollama_base_url=config_mgr.get("ollama_base_url"),
+        ollama_timeout=float(config_mgr.get("ollama_timeout") or 300),
+        ollama_keep_alive=config_mgr.get("ollama_keep_alive"),
+    )
+
+    # 创建内容处理配置
+    content_config = ContentConfig(
+        include_thinking=config_mgr.get("content_include_thinking") == "true",
+        include_tool=config_mgr.get("content_include_tool") == "true",
+        include_text=config_mgr.get("content_include_text") == "true",
+        max_chars_thinking=int(config_mgr.get("content_max_chars_thinking") or 200),
+        max_chars_tool=int(config_mgr.get("content_max_chars_tool") or 300),
+        max_chars_text=int(config_mgr.get("content_max_chars_text") or 500),
+    )
+
+    # 提取决策
+    decision_prompt = config_mgr.get("decision_extraction_prompt") or ""
+    extractor = DecisionExtractor(llm_client, content_config, decision_prompt)
+    msg_list = [{"role": m.role, "content": m.content} for m in messages]
+    decisions = extractor.extract_decisions(msg_list, project_name, "manual")
+
+    # 保存决策
+    saved_count = 0
+    for decision in decisions:
+        db.add_decision(decision)
+        saved_count += 1
+
+    # 标记消息为已决策提取
+    message_ids = [m.id for m in messages if m.id]
+    if message_ids:
+        db.mark_messages_decision_extracted(message_ids)
+
+    if saved_count > 0:
+        publish_event("decision_done", f"Extracted {saved_count} decisions", project_name)
+
+    return json_response({
+        "status": "ok",
+        "message": f"Extracted {saved_count} decisions",
+        "decisions": [{
+            "problem": d.problem,
+            "solution": d.solution,
+        } for d in decisions],
+    })
+
+
+@app.route("/api/projects/<project_name>/decisions/debug")
+def get_decision_debug(project_name):
+    """获取决策提取的 prompt 预览"""
+    from src.memory_core.prompts import DECISION_PROMPT
+    from src.memory_core.config import load_config
+
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+
+    db = Database(db_path)
+    config_mgr = load_config(GLOBAL_DB)
+
+    # 获取未进行决策提取的消息
+    messages = db.get_messages_for_decision(None)
+
+    # 创建内容处理配置
+    content_config = ContentConfig(
+        include_thinking=config_mgr.get("content_include_thinking") == "true",
+        include_tool=config_mgr.get("content_include_tool") == "true",
+        include_text=config_mgr.get("content_include_text") == "true",
+        max_chars_thinking=int(config_mgr.get("content_max_chars_thinking") or 200),
+        max_chars_tool=int(config_mgr.get("content_max_chars_tool") or 300),
+        max_chars_text=int(config_mgr.get("content_max_chars_text") or 500),
+    )
+
+    # 格式化对话（使用 ContentConfig）
+    lines = []
+    for msg in messages:
+        role = msg.role
+        content = process_content(msg.content, content_config)
+        if content.strip():
+            role_label = "User" if role == "user" else "Assistant"
+            lines.append(f"{role_label}: {content}")
+
+    conversation = "\n\n".join(lines)
+
+    # 使用自定义 prompt 或默认
+    custom_prompt = config_mgr.get("decision_extraction_prompt") or ""
+    prompt_template = custom_prompt if custom_prompt.strip() else DECISION_PROMPT
+    prompt = prompt_template.format(conversation=conversation)
+
+    return json_response({
+        "prompt": prompt,
+        "message_count": len(messages),
+        "conversation_length": len(conversation),
+    })
+
+
 @app.route("/api/logs")
 def get_logs():
     """获取合并的日志（app.log + hooks.log）"""
@@ -1092,6 +1214,7 @@ def get_config():
         "default_prompts": {
             "summary_prompt_template": get_prompt("summary_with_context"),
             "knowledge_extraction_prompt": get_prompt("extraction"),
+            "decision_extraction_prompt": get_prompt("decision"),
         },
         "i18n": {
             "category_names": get_prompt("category_names"),
@@ -1639,11 +1762,20 @@ def index():
             <h2>Decisions</h2>
             <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px; align-items: center;">
                 <button onclick="loadDecisions()" title="Refresh decisions list">Refresh</button>
+                <button onclick="extractDecisions()" style="background: #4a90d9;" title="Extract decisions from recent conversation">Extract Now</button>
+                <button onclick="loadDecisionDebug()" style="background: #6c5ce7; color: #fff;" title="View the prompt that will be sent to LLM">View Prompt</button>
                 <button onclick="filterDecisions('pending')" id="filter-pending-btn" style="background: #e94560;">Pending</button>
                 <button onclick="filterDecisions('confirmed')" id="filter-confirmed-btn" style="background: #333;">Confirmed</button>
                 <button onclick="filterDecisions('')" id="filter-all-btn" style="background: #333;">All</button>
                 <input type="text" id="decision-search" placeholder="Search decisions..." onkeyup="searchDecisionsDebounced()" style="padding: 8px 12px; flex: 1; min-width: 200px;">
                 <span id="decisions-status" style="color: #888; font-size: 0.85em; margin-left: 10px;"></span>
+            </div>
+            <div id="decision-debug-panel" style="display: none; margin-bottom: 15px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+                    <span style="color: #6c5ce7; font-weight: bold;">Decision Extraction Prompt Preview</span>
+                    <button onclick="document.getElementById('decision-debug-panel').style.display='none'" style="background: #333; padding: 2px 8px;">Close</button>
+                </div>
+                <pre id="decision-debug-content" style="background: #1a1a2e; padding: 10px; border-radius: 5px; max-height: 400px; overflow: auto; white-space: pre-wrap; font-size: 0.85em; border: 1px solid #6c5ce7;"></pre>
             </div>
 
             <!-- Pending Decisions -->
@@ -2189,16 +2321,16 @@ def index():
                 const isExcluded = idx < excludedCount;
                 // 使用 processed_content 作为显示内容
                 const displayContent = m.processed_content || m.content.substring(0, 200) + '...';
-                const isProcessed = m.processed_content && m.processed_content !== m.content;
+                const isTruncated = m.processed_content && m.processed_content !== m.content;
 
                 const excludedStyle = isExcluded ? 'opacity: 0.4;' : '';
                 const excludedBadge = isExcluded ? '<span style="background: #666; color: #ccc; padding: 1px 4px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">未包含</span>' : '';
-                const processedBadge = isProcessed && !isExcluded ? '<span style="background: #1a5a3a; color: #4ade80; padding: 1px 4px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">已处理</span>' : '';
+                const truncatedBadge = isTruncated && !isExcluded ? '<span style="background: #3a3a1a; color: #d9d94a; padding: 1px 4px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">已简化</span>' : '';
 
                 const roleLabel = isUser ? 'You' : formatModelName(m.model);
                 return `<div style="display: flex; justify-content: ${isUser ? 'flex-end' : 'flex-start'}; margin-bottom: 10px; ${excludedStyle}">
                     <div style="max-width: 90%; background: ${bgColor}; border-radius: 8px; padding: 10px; border-left: 3px solid ${borderColor};">
-                        <div style="font-size: 0.7em; color: ${borderColor}; font-weight: bold;">${roleLabel} <span style="color: #666; font-weight: normal;">#${m.id}</span>${excludedBadge}${processedBadge}</div>
+                        <div style="font-size: 0.7em; color: ${borderColor}; font-weight: bold;">${roleLabel} <span style="color: #666; font-weight: normal;">#${m.id}</span>${excludedBadge}${truncatedBadge}</div>
                         <div style="white-space: pre-wrap; word-break: break-word; font-size: 0.85em; color: #eee;">${escapeHtml(displayContent)}</div>
                     </div>
                 </div>`;
@@ -2658,7 +2790,7 @@ def index():
                 },
                 'Prompts': {
                     icon: '✏️',
-                    keys: ['prompt_language', 'summary_prompt_template', 'knowledge_extraction_prompt']
+                    keys: ['prompt_language', 'summary_prompt_template', 'knowledge_extraction_prompt', 'decision_extraction_prompt']
                 }
             };
 
@@ -2728,7 +2860,7 @@ def index():
                 'content_max_chars_thinking', 'content_max_chars_tool', 'content_max_chars_text',
                 'knowledge_max_items_per_category',
                 'search_result_preview_length', 'dashboard_refresh_interval',
-                'prompt_language', 'summary_prompt_template', 'knowledge_extraction_prompt'
+                'prompt_language', 'summary_prompt_template', 'knowledge_extraction_prompt', 'decision_extraction_prompt'
             ];
             for (const key of configKeys) {
                 const el = document.getElementById(`config-${key}`);
@@ -2972,6 +3104,57 @@ def index():
                     : '<div style="color: #888; padding: 10px;">No confirmed decisions</div>';
 
                 document.getElementById('decisions-status').textContent = '';
+            } catch (e) {
+                document.getElementById('decisions-status').textContent = 'Error: ' + e.message;
+            }
+        }
+
+        async function extractDecisions() {
+            if (!currentProject) {
+                alert('Please select a project first');
+                return;
+            }
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Extracting...';
+            document.getElementById('decisions-status').textContent = 'Sending to LLM...';
+
+            try {
+                const res = await fetch(`/api/projects/${currentProject}/decisions/extract`, {method: 'POST'});
+                const data = await res.json();
+                btn.disabled = false;
+                btn.textContent = 'Extract Now';
+                document.getElementById('decisions-status').textContent = '';
+
+                if (data.error) {
+                    document.getElementById('decisions-status').textContent = 'Error: ' + data.error;
+                } else {
+                    document.getElementById('decisions-status').textContent = data.message;
+                    loadDecisions();
+                }
+            } catch (e) {
+                btn.disabled = false;
+                btn.textContent = 'Extract Now';
+                document.getElementById('decisions-status').textContent = 'Error: ' + e.message;
+            }
+        }
+
+        async function loadDecisionDebug() {
+            if (!currentProject) {
+                alert('Please select a project first');
+                return;
+            }
+            document.getElementById('decisions-status').textContent = 'Loading prompt...';
+
+            try {
+                const res = await fetch(`/api/projects/${currentProject}/decisions/debug`);
+                const data = await res.json();
+                document.getElementById('decisions-status').textContent = '';
+
+                const panel = document.getElementById('decision-debug-panel');
+                const content = document.getElementById('decision-debug-content');
+                content.textContent = `=== Messages: ${data.message_count}, Conversation: ${data.conversation_length} chars ===\n\n${data.prompt}`;
+                panel.style.display = 'block';
             } catch (e) {
                 document.getElementById('decisions-status').textContent = 'Error: ' + e.message;
             }

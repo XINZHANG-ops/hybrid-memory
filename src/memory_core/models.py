@@ -14,6 +14,8 @@ class Message:
     timestamp: datetime = field(default_factory=datetime.now)
     token_count: int = 0
     is_summarized: bool = False
+    is_knowledge_extracted: bool = False
+    is_decision_extracted: bool = False
     model: str = ""
 
 

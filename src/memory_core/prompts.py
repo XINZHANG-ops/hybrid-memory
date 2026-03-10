@@ -143,6 +143,90 @@ Requirements:
 
 Please output JSON directly:"""
 
+# ============ Decision Extraction Prompts ============
+
+_DECISION_EXTRACTION_PROMPT_ZH = """分析以下对话，提取所有**决策点** - 即识别了问题并选择了解决方案的时刻。
+
+决策点包含：
+1. 遇到的问题或难题
+2. 采取的解决方案或方法
+3. 选择的原因
+
+返回决策的 JSON 数组：
+```json
+{{
+  "decisions": [
+    {{
+      "problem": "问题的简要描述（1-2句话）",
+      "solution": "采取的解决方案（1-2句话）",
+      "reason_options": ["可能原因1", "可能原因2", "可能原因3"],
+      "files": ["file1.py", "file2.js"]
+    }}
+  ]
+}}
+```
+
+如果没有决策点，返回：
+```json
+{{
+  "decisions": []
+}}
+```
+
+指南：
+- 提取所有决策，可能有0个、1个或多个
+- 关注技术决策，而非日常操作
+- 决策涉及在多个选项中做出选择或解决非平凡问题
+- reason_options 应包含2-4个合理的原因（用户将选择正确的）
+- files 只列出主要涉及的文件（最多1-3个）
+- 保持 problem 和 solution 简洁
+
+对话内容：
+{conversation}
+
+提取决策（仅输出 JSON）："""
+
+_DECISION_EXTRACTION_PROMPT_EN = """Analyze the following conversation and extract ALL decision points - moments where a problem was identified and a solution was chosen.
+
+A decision point includes:
+1. A problem or issue that was encountered
+2. A solution or approach that was taken
+3. The reasoning behind the choice
+
+Return a JSON array of decisions:
+```json
+{{
+  "decisions": [
+    {{
+      "problem": "Brief description of the problem (1-2 sentences)",
+      "solution": "Brief description of the solution taken (1-2 sentences)",
+      "reason_options": ["Possible reason 1", "Possible reason 2", "Possible reason 3"],
+      "files": ["file1.py", "file2.js"]
+    }}
+  ]
+}}
+```
+
+If there are NO decision points, return:
+```json
+{{
+  "decisions": []
+}}
+```
+
+Guidelines:
+- Extract ALL decisions, there may be 0, 1, or multiple
+- Focus on technical decisions, not routine actions
+- A decision involves choosing between alternatives or solving a non-trivial problem
+- reason_options should be 2-4 plausible reasons (the user will select the correct one)
+- files should list only the main files involved (1-3 files max)
+- Keep problem and solution concise
+
+Conversation:
+{conversation}
+
+Extract decisions (JSON only):"""
+
 # ============ Category Names ============
 
 _CATEGORY_NAMES_ZH = {
@@ -194,6 +278,7 @@ _PROMPTS = {
         "summary_with_context": _SUMMARY_PROMPT_WITH_CONTEXT_ZH,
         "summary": _SUMMARY_PROMPT_ZH,
         "extraction": _EXTRACTION_PROMPT_ZH,
+        "decision": _DECISION_EXTRACTION_PROMPT_ZH,
         "category_names": _CATEGORY_NAMES_ZH,
         "role_labels": _ROLE_LABELS_ZH,
         "ui_text": _UI_TEXT_ZH,
@@ -202,6 +287,7 @@ _PROMPTS = {
         "summary_with_context": _SUMMARY_PROMPT_WITH_CONTEXT_EN,
         "summary": _SUMMARY_PROMPT_EN,
         "extraction": _EXTRACTION_PROMPT_EN,
+        "decision": _DECISION_EXTRACTION_PROMPT_EN,
         "category_names": _CATEGORY_NAMES_EN,
         "role_labels": _ROLE_LABELS_EN,
         "ui_text": _UI_TEXT_EN,
@@ -251,6 +337,10 @@ class _PromptAccessor:
     @property
     def EXTRACTION_PROMPT(self):
         return get_prompt("extraction")
+
+    @property
+    def DECISION_PROMPT(self):
+        return get_prompt("decision")
 
     @property
     def CATEGORY_NAMES(self):

@@ -33,6 +33,8 @@ DEFAULT_CONFIG = {
     "summary_prompt_template": "",  # 空=使用默认模板
     # 知识提取 Prompt
     "knowledge_extraction_prompt": "",  # 空=使用默认模板
+    # 决策提取 Prompt
+    "decision_extraction_prompt": "",  # 空=使用默认模板
     # 总结生成配置
     "summary_max_chars_total": "8000",
     # 内容处理配置（用于总结、知识提取、历史注入等）
@@ -231,7 +233,14 @@ CONFIG_META = {
     "knowledge_extraction_prompt": {
         "label": "知识提取 Prompt",
         "description": "自定义知识提取的 prompt 模板",
-        "tooltip": "可用变量：{existing_knowledge}（已有知识）、{conversation}（当前对话）。留空则使用系统默认模板。输出需为 JSON 格式，包含 user_preferences、project_decisions、key_facts、pending_tasks、learned_patterns、important_context 六个数组字段。",
+        "tooltip": "可用变量：{existing_knowledge}（已有知识）、{conversation}（当前对话）、{max_items}（每类最大条目数）。留空则使用系统默认模板。输出需为 JSON 格式，包含 user_preferences、project_decisions、key_facts、pending_tasks、learned_patterns、important_context 六个数组字段。",
+        "type": "textarea",
+        "group": "Advanced",
+    },
+    "decision_extraction_prompt": {
+        "label": "决策提取 Prompt",
+        "description": "自定义决策提取的 prompt 模板",
+        "tooltip": "可用变量：{conversation}（当前对话）。留空则使用系统默认模板。输出需为 JSON 格式，包含 decisions 数组，每个决策包含 problem、solution、reason_options、files 字段。",
         "type": "textarea",
         "group": "Advanced",
     },

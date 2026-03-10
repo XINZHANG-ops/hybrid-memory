@@ -13,64 +13,31 @@ from datetime import datetime
 from loguru import logger
 from .models import Decision
 from .llm_client import LLMClient
-
-
-DECISION_EXTRACTION_PROMPT = """Analyze the following conversation and identify if there's a **decision point** - a moment where a problem was identified and a solution was chosen.
-
-A decision point includes:
-1. A problem or issue that was encountered
-2. A solution or approach that was taken
-3. The reasoning behind the choice
-
-If you find a decision point, extract it in the following JSON format:
-```json
-{{
-  "has_decision": true,
-  "problem": "Brief description of the problem (1-2 sentences)",
-  "solution": "Brief description of the solution taken (1-2 sentences)",
-  "reason_options": [
-    "Possible reason 1",
-    "Possible reason 2",
-    "Possible reason 3"
-  ],
-  "files": ["file1.py", "file2.js"]
-}}
-```
-
-If there's no clear decision point, return:
-```json
-{{
-  "has_decision": false
-}}
-```
-
-Guidelines:
-- Focus on technical decisions, not routine actions
-- A decision involves choosing between alternatives or solving a non-trivial problem
-- reason_options should be 2-4 plausible reasons (the user will select the correct one)
-- files should list only the main files involved (1-3 files max)
-- Keep problem and solution concise
-
-Conversation:
-{conversation}
-
-Extract the decision (JSON only):"""
+from .content_processor import ContentConfig, process_content
+from .prompts import DECISION_PROMPT
 
 
 class DecisionExtractor:
-    def __init__(self, llm_client: LLMClient):
+    def __init__(
+        self,
+        llm_client: LLMClient,
+        content_config: ContentConfig | None = None,
+        decision_prompt: str = "",
+    ):
         self.llm_client = llm_client
-        logger.info("DecisionExtractor initialized")
+        self.content_config = content_config or ContentConfig()
+        self.decision_prompt = decision_prompt
+        logger.info(f"DecisionExtractor initialized (content_config={self.content_config})")
 
-    def extract_decision(
+    def extract_decisions(
         self,
         messages: list,
         project: str,
         session_id: str,
-        max_messages: int = 10
-    ) -> Decision | None:
+        max_messages: int = 20
+    ) -> list[Decision]:
         """
-        从最近的消息中提取决策
+        从消息中提取所有决策（可能 0 个、1 个或多个）
 
         Args:
             messages: 消息列表 (包含 role 和 content)
@@ -79,10 +46,10 @@ class DecisionExtractor:
             max_messages: 分析的最大消息数
 
         Returns:
-            Decision 对象或 None（如果没有检测到决策）
+            Decision 对象列表（可能为空）
         """
         if not messages:
-            return None
+            return []
 
         # 只取最近的消息
         recent_messages = messages[-max_messages:]
@@ -90,73 +57,74 @@ class DecisionExtractor:
         # 格式化对话
         conversation = self._format_conversation(recent_messages)
         if not conversation.strip():
-            return None
+            return []
 
-        prompt = DECISION_EXTRACTION_PROMPT.format(conversation=conversation)
+        # 使用自定义 prompt 或默认
+        prompt_template = self.decision_prompt if self.decision_prompt and self.decision_prompt.strip() else DECISION_PROMPT
+        try:
+            prompt = prompt_template.format(conversation=conversation)
+        except KeyError as e:
+            logger.warning(f"Custom decision prompt format error: {e}, falling back to default")
+            prompt = DECISION_PROMPT.format(conversation=conversation)
 
         try:
-            logger.debug(f"Extracting decision from {len(recent_messages)} messages")
+            logger.debug(f"Extracting decisions from {len(recent_messages)} messages")
             response = self.llm_client.generate(prompt)
 
             # 解析 JSON 响应
             result = self._parse_response(response)
-            if not result or not result.get("has_decision"):
-                logger.debug("No decision detected in conversation")
-                return None
+            if not result:
+                logger.debug("Failed to parse decision response")
+                return []
 
-            # 创建 Decision 对象
-            decision = Decision(
-                id=None,
-                project=project,
-                session_id=session_id,
-                problem=result.get("problem", ""),
-                solution=result.get("solution", ""),
-                status="pending",
-                reason="",
-                reason_options=json.dumps(result.get("reason_options", []), ensure_ascii=False),
-                note="",
-                files=json.dumps(result.get("files", []), ensure_ascii=False),
-                tags="[]",
-                timestamp=datetime.now(),
-            )
+            decisions_data = result.get("decisions", [])
+            if not decisions_data:
+                logger.debug("No decisions detected in conversation")
+                return []
 
-            logger.info(f"Decision extracted: {decision.problem[:50]}...")
-            return decision
+            # 创建 Decision 对象列表
+            decisions = []
+            now = datetime.now()
+            for item in decisions_data:
+                if not item.get("problem") or not item.get("solution"):
+                    continue
+                decision = Decision(
+                    id=None,
+                    project=project,
+                    session_id=session_id,
+                    problem=item.get("problem", ""),
+                    solution=item.get("solution", ""),
+                    status="pending",
+                    reason="",
+                    reason_options=json.dumps(item.get("reason_options", []), ensure_ascii=False),
+                    note="",
+                    files=json.dumps(item.get("files", []), ensure_ascii=False),
+                    tags="[]",
+                    timestamp=now,
+                )
+                decisions.append(decision)
+
+            logger.info(f"Extracted {len(decisions)} decisions")
+            return decisions
 
         except Exception as e:
-            logger.error(f"Error extracting decision: {e}")
-            return None
+            logger.error(f"Error extracting decisions: {e}")
+            return []
 
     def _format_conversation(self, messages: list) -> str:
-        """格式化消息为对话文本"""
+        """格式化消息为对话文本（使用 ContentConfig）"""
         lines = []
         for msg in messages:
             role = msg.get("role", "unknown")
             content = msg.get("content", "")
 
-            # 如果 content 是 JSON 数组，提取文本部分
-            if isinstance(content, str) and content.startswith("["):
-                try:
-                    parts = json.loads(content)
-                    text_parts = []
-                    for part in parts:
-                        if isinstance(part, dict):
-                            if part.get("type") == "text":
-                                text_parts.append(part.get("content", ""))
-                            elif part.get("type") == "tool":
-                                tool_name = part.get("name", "tool")
-                                text_parts.append(f"[Used {tool_name}]")
-                    content = " ".join(text_parts)
-                except json.JSONDecodeError:
-                    pass
+            # 使用统一的内容处理
+            processed = process_content(content, self.content_config)
+            if not processed:
+                continue
 
-            # 截断过长的内容
-            if len(content) > 1000:
-                content = content[:1000] + "..."
-
-            if content.strip():
-                role_label = "User" if role == "user" else "Assistant"
-                lines.append(f"{role_label}: {content}")
+            role_label = "User" if role == "user" else "Assistant"
+            lines.append(f"{role_label}: {processed}")
 
         return "\n\n".join(lines)
 
@@ -176,8 +144,8 @@ class DecisionExtractor:
             except json.JSONDecodeError:
                 pass
 
-        # 尝试找到任何 JSON 对象
-        json_match = re.search(r'\{[^{}]*"has_decision"[^{}]*\}', response, re.DOTALL)
+        # 尝试找到包含 decisions 数组的 JSON 对象
+        json_match = re.search(r'\{[^{}]*"decisions"\s*:\s*\[.*?\]\s*\}', response, re.DOTALL)
         if json_match:
             try:
                 return json.loads(json_match.group(0))
