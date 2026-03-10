@@ -6,19 +6,29 @@ import faiss
 
 
 class VectorStore:
-    def __init__(self, db_path: Path, dimension: int = 768):
+    def __init__(self, db_path: Path, dimension: int = 768, store_type: str = "message"):
+        """
+        Args:
+            db_path: 数据库路径
+            dimension: 向量维度
+            store_type: 存储类型，"message" 或 "decision"
+        """
         self.db_path = Path(db_path)
         self.dimension = dimension
-        self.index_path = self.db_path.parent / f"{self.db_path.stem}_vectors.faiss"
-        self.mapping_path = self.db_path.parent / f"{self.db_path.stem}_vectors_mapping.json"
+        self.store_type = store_type
+
+        # 根据类型生成不同的文件名
+        suffix = "" if store_type == "message" else f"_{store_type}"
+        self.index_path = self.db_path.parent / f"{self.db_path.stem}_vectors{suffix}.faiss"
+        self.mapping_path = self.db_path.parent / f"{self.db_path.stem}_vectors{suffix}_mapping.json"
 
         self.index = None
-        self.id_to_msg: dict[int, int] = {}  # faiss_id -> message_id
-        self.msg_to_id: dict[int, int] = {}  # message_id -> faiss_id
+        self.id_to_msg: dict[int, int] = {}  # faiss_id -> item_id
+        self.msg_to_id: dict[int, int] = {}  # item_id -> faiss_id
         self.next_id = 0
 
         self._load_or_create()
-        logger.info(f"VectorStore initialized: {self.index_path}, vectors={self.index.ntotal if self.index else 0}")
+        logger.info(f"VectorStore[{store_type}] initialized: {self.index_path}, vectors={self.index.ntotal if self.index else 0}")
 
     def _load_or_create(self):
         if self.index_path.exists() and self.mapping_path.exists():
@@ -38,7 +48,7 @@ class VectorStore:
         self.id_to_msg = {}
         self.msg_to_id = {}
         self.next_id = 0
-        logger.info(f"Created new vector index: dimension={self.dimension}")
+        logger.info(f"Created new vector index[{self.store_type}]: dimension={self.dimension}")
 
     def save(self):
         try:

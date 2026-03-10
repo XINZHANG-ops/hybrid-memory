@@ -1,6 +1,6 @@
 from loguru import logger
 from .database import Database
-from .models import Message
+from .models import Message, Decision
 
 try:
     from rapidfuzz import fuzz
@@ -87,3 +87,72 @@ class MemoryRetriever:
         results = scored_messages[:limit]
         logger.info(f"BM25 search completed: {len(results)} results")
         return results
+
+    def decision_bm25_search(self, query: str, limit: int = 20) -> list[tuple[Decision, float]]:
+        """使用 BM25 算法搜索 Decision"""
+        if not BM25_AVAILABLE:
+            logger.warning("BM25 not available, falling back to fuzzy search")
+            return self._decision_fuzzy_search(query, limit, threshold=30)
+
+        logger.debug(f"Performing Decision BM25 search: query='{query}'")
+        decisions = self.db.get_decisions(status="confirmed", limit=500)
+        if not decisions:
+            return []
+
+        def tokenize(text: str) -> list[str]:
+            tokens = list(jieba.cut(text.lower()))
+            return [t.strip() for t in tokens if t.strip() and len(t.strip()) > 0]
+
+        # 将 problem + solution + reason 组合作为文档
+        def get_decision_text(d: Decision) -> str:
+            text = f"{d.problem} {d.solution}"
+            if d.reason:
+                text += f" {d.reason}"
+            return text
+
+        corpus = [tokenize(get_decision_text(d)) for d in decisions]
+        query_tokens = tokenize(query)
+
+        if not query_tokens or not any(corpus):
+            return []
+
+        bm25 = BM25Okapi(corpus)
+        scores = bm25.get_scores(query_tokens)
+
+        scored_decisions = [(d, score) for d, score in zip(decisions, scores) if score > 0]
+        scored_decisions.sort(key=lambda x: x[1], reverse=True)
+
+        results = scored_decisions[:limit]
+        logger.info(f"Decision BM25 search completed: {len(results)} results")
+        return results
+
+    def _decision_fuzzy_search(self, query: str, limit: int, threshold: int = 60) -> list[tuple[Decision, float]]:
+        """使用 fuzzy 搜索 Decision"""
+        if not FUZZY_AVAILABLE:
+            logger.warning("Fuzzy search not available")
+            return []
+
+        logger.debug(f"Performing Decision fuzzy search with threshold={threshold}")
+        decisions = self.db.get_decisions(status="confirmed", limit=500)
+
+        def get_decision_text(d: Decision) -> str:
+            text = f"{d.problem} {d.solution}"
+            if d.reason:
+                text += f" {d.reason}"
+            return text
+
+        scored = []
+        for d in decisions:
+            text = get_decision_text(d)
+            score = fuzz.partial_ratio(query.lower(), text.lower())
+            if score >= threshold:
+                scored.append((d, score / 100.0))  # 归一化到 0-1
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        results = scored[:limit]
+        logger.info(f"Decision fuzzy search completed: {len(results)} results")
+        return results
+
+    def decision_fuzzy_search(self, query: str, limit: int = 20, threshold: int = 60) -> list[tuple[Decision, float]]:
+        """公开的 Decision fuzzy 搜索方法"""
+        return self._decision_fuzzy_search(query, limit, threshold)

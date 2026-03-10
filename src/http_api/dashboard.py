@@ -723,6 +723,126 @@ def unified_search():
     return json_response({"results": results, "method": method, "scope": scope, "total": len(results)})
 
 
+@app.route("/api/search/decisions")
+def unified_search_decisions():
+    """Decision 统一搜索 API - 支持 vector, bm25, fuzzy, combined"""
+    query = request.args.get("query", "")
+    method = request.args.get("method", "combined")
+    scope = request.args.get("scope", "current")
+    project = request.args.get("project", "")
+    limit = int(request.args.get("limit", "30"))
+    threshold = int(request.args.get("threshold", "60"))
+
+    if not query:
+        return json_response({"results": [], "method": method, "scope": scope})
+
+    from src.memory_core.config import load_config
+
+    results = []
+
+    def search_project_decisions(db_path, proj_name):
+        try:
+            config_mgr = load_config(GLOBAL_DB)
+            config_kwargs = config_mgr.get_memory_manager_kwargs()
+            manager = MemoryManager(db_path=db_path, **config_kwargs)
+
+            proj_results = []
+
+            if method == "vector":
+                for decision, score in manager.decision_vector_search(query, k=limit):
+                    proj_results.append({
+                        "id": decision.id, "project": proj_name,
+                        "problem": decision.problem, "solution": decision.solution,
+                        "reason": decision.reason or "", "note": decision.note or "",
+                        "score": round(score, 4), "timestamp": str(decision.timestamp),
+                        "method": "vector"
+                    })
+            elif method == "bm25":
+                for decision, score in manager.decision_bm25_search(query, limit=limit):
+                    proj_results.append({
+                        "id": decision.id, "project": proj_name,
+                        "problem": decision.problem, "solution": decision.solution,
+                        "reason": decision.reason or "", "note": decision.note or "",
+                        "score": round(score, 4), "timestamp": str(decision.timestamp),
+                        "method": "bm25"
+                    })
+            elif method == "fuzzy":
+                for decision, score in manager.retriever.decision_fuzzy_search(query, limit=limit, threshold=threshold):
+                    proj_results.append({
+                        "id": decision.id, "project": proj_name,
+                        "problem": decision.problem, "solution": decision.solution,
+                        "reason": decision.reason or "", "note": decision.note or "",
+                        "score": round(score, 4), "timestamp": str(decision.timestamp),
+                        "method": "fuzzy"
+                    })
+            else:  # combined
+                vector_results = manager.decision_vector_search(query, k=limit)
+                bm25_results = manager.decision_bm25_search(query, limit=limit)
+
+                def normalize_scores(results):
+                    if not results:
+                        return {}
+                    scores = [s for _, s in results]
+                    max_s, min_s = max(scores) if scores else 1, min(scores) if scores else 0
+                    range_s = max_s - min_s if max_s != min_s else 1
+                    return {d.id: (score - min_s) / range_s for d, score in results}
+
+                vector_scores = normalize_scores(vector_results)
+                bm25_scores = normalize_scores(bm25_results)
+
+                all_decisions = {}
+                for d, _ in vector_results:
+                    all_decisions[d.id] = d
+                for d, _ in bm25_results:
+                    all_decisions[d.id] = d
+
+                VECTOR_WEIGHT = 0.5
+                BM25_WEIGHT = 0.5
+                combined_scores = {}
+                for d_id, d in all_decisions.items():
+                    v_score = vector_scores.get(d_id, 0)
+                    b_score = bm25_scores.get(d_id, 0)
+                    combined_scores[d_id] = v_score * VECTOR_WEIGHT + b_score * BM25_WEIGHT
+
+                sorted_ids = sorted(combined_scores.keys(), key=lambda x: combined_scores[x], reverse=True)
+
+                for d_id in sorted_ids[:limit]:
+                    d = all_decisions[d_id]
+                    v_s = vector_scores.get(d_id, 0)
+                    b_s = bm25_scores.get(d_id, 0)
+                    source = "vector+bm25" if v_s > 0 and b_s > 0 else ("vector" if v_s > 0 else "bm25")
+                    proj_results.append({
+                        "id": d.id, "project": proj_name,
+                        "problem": d.problem, "solution": d.solution,
+                        "reason": d.reason or "", "note": d.note or "",
+                        "score": round(combined_scores[d_id], 4),
+                        "timestamp": str(d.timestamp), "method": source,
+                        "vector_score": round(v_s, 3), "bm25_score": round(b_s, 3)
+                    })
+
+            return proj_results
+        except Exception as e:
+            return [{"error": str(e), "project": proj_name}]
+
+    if scope == "all":
+        for proj_name in get_project_list():
+            db_path = PROJECTS_DIR / f"{proj_name}.db"
+            results.extend(search_project_decisions(db_path, proj_name))
+    else:
+        if not project:
+            return json_response({"error": "Project required for current scope", "results": []})
+        db_path = PROJECTS_DIR / f"{project}.db"
+        if not db_path.exists():
+            return json_response({"error": "Project not found", "results": []})
+        results = search_project_decisions(db_path, project)
+
+    results = [r for r in results if "error" not in r]
+    results.sort(key=lambda x: x.get("score", 0), reverse=True)
+    results = results[:limit]
+
+    return json_response({"results": results, "method": method, "scope": scope, "total": len(results)})
+
+
 @app.route("/api/projects/<project_name>/knowledge")
 def get_knowledge(project_name):
     """获取项目的结构化知识"""
@@ -1405,7 +1525,7 @@ def clear_events():
 
 @app.route("/api/projects/<project_name>/vectors/stats")
 def get_vector_stats(project_name):
-    """获取向量库统计信息"""
+    """获取向量库统计信息（包括 Message 和 Decision）"""
     db_path = PROJECTS_DIR / f"{project_name}.db"
     if not db_path.exists():
         return json_response({"error": "Project not found"}), 404
@@ -1413,10 +1533,20 @@ def get_vector_stats(project_name):
         from src.memory_core.vector_store import VectorStore
         from src.memory_core.config import load_config
         config_mgr = load_config(GLOBAL_DB)
-        # 获取 embedding 维度（根据模型）
-        vector_store = VectorStore(db_path)
-        stats = vector_store.get_stats()
-        return json_response(stats)
+        # Message 向量统计
+        message_vector_store = VectorStore(db_path, store_type="message")
+        message_stats = message_vector_store.get_stats()
+        # Decision 向量统计
+        decision_vector_store = VectorStore(db_path, store_type="decision")
+        decision_stats = decision_vector_store.get_stats()
+        return json_response({
+            "message": message_stats,
+            "decision": decision_stats,
+            # 保持向后兼容
+            "total_vectors": message_stats["total_vectors"],
+            "mapped_messages": message_stats["mapped_messages"],
+            "dimension": message_stats["dimension"],
+        })
     except Exception as e:
         return json_response({"error": str(e)}), 500
 
@@ -1479,6 +1609,66 @@ def rebuild_vectors(project_name):
         })
     except Exception as e:
         publish_event("error", f"Rebuild failed: {str(e)}", project_name)
+        return json_response({"error": str(e)}), 500
+
+
+@app.route("/api/projects/<project_name>/vectors/rebuild-decisions", methods=["POST"])
+def rebuild_decision_vectors(project_name):
+    """重建 Decision 向量数据库"""
+    from src.memory_core.events import publish_event
+
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+
+    try:
+        from src.memory_core.config import load_config
+        from src.memory_core.vector_store import VectorStore
+        from src.memory_core.embedding_client import EmbeddingClient
+
+        config_mgr = load_config(GLOBAL_DB)
+        embedding_model = config_mgr.get("embedding_model")
+        embedding_base_url = config_mgr.get("embedding_base_url") or config_mgr.get("ollama_base_url")
+
+        publish_event("embedding", f"Rebuilding decision vectors for {project_name}", f"Model: {embedding_model}")
+
+        db = Database(db_path)
+        vector_store = VectorStore(db_path, store_type="decision")
+        old_count = vector_store.get_stats()["total_vectors"]
+        vector_store.clear()
+
+        # 获取所有已确认的决策
+        decisions = db.get_decisions(status="confirmed", limit=1000)
+
+        if not decisions:
+            return json_response({"status": "ok", "message": "No decisions to index", "rebuilt": 0})
+
+        embedding_client = EmbeddingClient(model=embedding_model, base_url=embedding_base_url)
+
+        rebuilt = 0
+        import numpy as np
+        for decision in decisions:
+            try:
+                content = f"{decision.problem}\n{decision.solution}"
+                if decision.reason:
+                    content += f"\n{decision.reason}"
+                embedding = embedding_client.embed(content)
+                if embedding is not None:
+                    vector_store.add(decision.id, np.array(embedding))
+                    rebuilt += 1
+            except Exception as e:
+                pass
+
+        publish_event("embedding", f"Rebuilt {rebuilt} decision vectors", f"Cleared {old_count}, new {rebuilt}")
+
+        return json_response({
+            "status": "ok",
+            "old_count": old_count,
+            "rebuilt": rebuilt,
+            "total_decisions": len(decisions),
+        })
+    except Exception as e:
+        publish_event("error", f"Decision rebuild failed: {str(e)}", project_name)
         return json_response({"error": str(e)}), 500
 
 
@@ -1729,6 +1919,13 @@ def index():
                 </div>
                 <div style="display: flex; gap: 20px; flex-wrap: wrap; align-items: center;">
                     <div>
+                        <label style="color: #888; font-size: 0.9em;">Type:</label>
+                        <select id="search-type" style="margin-left: 5px;" onchange="onSearchTypeChange()">
+                            <option value="message">Messages</option>
+                            <option value="decision">Decisions</option>
+                        </select>
+                    </div>
+                    <div>
                         <label style="color: #888; font-size: 0.9em;">Scope:</label>
                         <select id="search-scope" style="margin-left: 5px;">
                             <option value="current">Current Project</option>
@@ -1760,7 +1957,8 @@ def index():
                     </div>
                     <div style="display: flex; gap: 8px;">
                         <button onclick="loadVectorStats()" style="padding: 6px 12px; background: #1f4068;">Refresh</button>
-                        <button onclick="rebuildVectors()" style="padding: 6px 12px; background: #e94560;">Rebuild Vectors</button>
+                        <button onclick="rebuildVectors()" style="padding: 6px 12px; background: #e94560;">Rebuild Messages</button>
+                        <button onclick="rebuildDecisionVectors()" style="padding: 6px 12px; background: #6c5ce7;">Rebuild Decisions</button>
                     </div>
                 </div>
                 <div style="color: #666; font-size: 0.8em; margin-top: 8px;">
@@ -2726,10 +2924,19 @@ def index():
             document.getElementById('fuzzy-options').style.display = method === 'fuzzy' ? 'block' : 'none';
         }
 
+        function onSearchTypeChange() {
+            // 切换搜索类型时可以做一些 UI 调整
+            const searchType = document.getElementById('search-type').value;
+            document.getElementById('search-query').placeholder = searchType === 'decision'
+                ? 'Search decisions (problem, solution, reason)...'
+                : 'Enter search query...';
+        }
+
         async function doUnifiedSearch() {
             const query = document.getElementById('search-query').value;
             if (!query) return;
 
+            const searchType = document.getElementById('search-type').value;
             const scope = document.getElementById('search-scope').value;
             const method = document.getElementById('search-method').value;
             const threshold = document.getElementById('fuzzy-threshold').value || 60;
@@ -2742,7 +2949,9 @@ def index():
             document.getElementById('search-status').textContent = 'Searching...';
             document.getElementById('search-results').innerHTML = '';
 
-            let url = `/api/search?query=${encodeURIComponent(query)}&method=${method}&scope=${scope}&limit=30`;
+            // 根据搜索类型选择 API
+            const apiPath = searchType === 'decision' ? '/api/search/decisions' : '/api/search';
+            let url = `${apiPath}?query=${encodeURIComponent(query)}&method=${method}&scope=${scope}&limit=30`;
             if (scope === 'current') {
                 url += `&project=${encodeURIComponent(currentProject)}`;
             }
@@ -2759,29 +2968,60 @@ def index():
                     return;
                 }
 
+                const typeLabel = searchType === 'decision' ? 'decisions' : 'messages';
                 const methodLabels = {vector: '🧠 Semantic', bm25: '🔑 Keyword', fuzzy: '〰️ Fuzzy', combined: '🔗 Combined'};
-                document.getElementById('search-status').textContent = `Found ${data.total || 0} results using ${methodLabels[data.method] || data.method}`;
+                document.getElementById('search-status').textContent = `Found ${data.total || 0} ${typeLabel} using ${methodLabels[data.method] || data.method}`;
 
-                document.getElementById('search-results').innerHTML = data.results.map(r => {
-                    const isUser = r.role === 'user';
-                    const bgColor = isUser ? '#1a3a5c' : '#2d1f3d';
-                    const borderColor = isUser ? '#00d9ff' : '#e94560';
-                    const roleLabel = isUser ? 'user' : formatModelName(r.model);
-                    const methodBadge = r.method ? `<span style="background: ${r.method === 'vector' ? '#4a90d9' : '#d94a90'}; color: #fff; padding: 1px 6px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">${r.method}</span>` : '';
-                    const scoreBadge = r.score > 0 ? `<span style="color: #888; font-size: 0.8em; margin-left: 8px;">score: ${r.score}</span>` : '';
-                    const projectBadge = scope === 'all' ? `<span class="badge" style="margin-left: 5px;">${r.project}</span>` : '';
-                    return `
-                    <div class="card" style="margin-bottom: 10px; background: ${bgColor}; border-left: 3px solid ${borderColor};">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                            <div>
-                                <span style="color: ${borderColor}; font-weight: bold;">${roleLabel}</span>
-                                ${projectBadge}${methodBadge}${scoreBadge}
+                if (searchType === 'decision') {
+                    // Decision 结果渲染
+                    document.getElementById('search-results').innerHTML = data.results.map(r => {
+                        const methodBadge = r.method ? `<span style="background: ${r.method === 'vector' ? '#4a90d9' : r.method === 'bm25' ? '#d94a90' : '#6c5ce7'}; color: #fff; padding: 1px 6px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">${r.method}</span>` : '';
+                        const scoreBadge = r.score > 0 ? `<span style="color: #888; font-size: 0.8em; margin-left: 8px;">score: ${r.score}</span>` : '';
+                        const projectBadge = scope === 'all' ? `<span class="badge" style="margin-left: 5px;">${r.project}</span>` : '';
+                        return `
+                        <div class="card" style="margin-bottom: 10px; background: #1f2d3d; border-left: 3px solid #6c5ce7;">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                                <div>
+                                    <span style="color: #6c5ce7; font-weight: bold;">Decision #${r.id}</span>
+                                    ${projectBadge}${methodBadge}${scoreBadge}
+                                </div>
+                                <span style="color: #666; font-size: 0.75em;">${r.timestamp}</span>
                             </div>
-                            <span style="color: #666; font-size: 0.75em;">${r.timestamp}</span>
-                        </div>
-                        <div style="white-space: pre-wrap; word-break: break-word; line-height: 1.5; color: #eee;">${escapeHtml(r.content)}</div>
-                    </div>`;
-                }).join('') || '<div class="card" style="color: #888;">No results found</div>';
+                            <div style="margin-bottom: 8px;">
+                                <span style="color: #e94560; font-weight: bold;">Problem:</span>
+                                <span style="color: #eee;">${escapeHtml(r.problem)}</span>
+                            </div>
+                            <div style="margin-bottom: 8px;">
+                                <span style="color: #00d9ff; font-weight: bold;">Solution:</span>
+                                <span style="color: #eee;">${escapeHtml(r.solution)}</span>
+                            </div>
+                            ${r.reason ? `<div style="color: #888; font-size: 0.9em;"><span style="color: #d9a04a;">Reason:</span> ${escapeHtml(r.reason)}</div>` : ''}
+                            ${r.note ? `<div style="color: #888; font-size: 0.9em;"><span style="color: #888;">Note:</span> ${escapeHtml(r.note)}</div>` : ''}
+                        </div>`;
+                    }).join('') || '<div class="card" style="color: #888;">No decisions found</div>';
+                } else {
+                    // Message 结果渲染
+                    document.getElementById('search-results').innerHTML = data.results.map(r => {
+                        const isUser = r.role === 'user';
+                        const bgColor = isUser ? '#1a3a5c' : '#2d1f3d';
+                        const borderColor = isUser ? '#00d9ff' : '#e94560';
+                        const roleLabel = isUser ? 'user' : formatModelName(r.model);
+                        const methodBadge = r.method ? `<span style="background: ${r.method === 'vector' ? '#4a90d9' : '#d94a90'}; color: #fff; padding: 1px 6px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">${r.method}</span>` : '';
+                        const scoreBadge = r.score > 0 ? `<span style="color: #888; font-size: 0.8em; margin-left: 8px;">score: ${r.score}</span>` : '';
+                        const projectBadge = scope === 'all' ? `<span class="badge" style="margin-left: 5px;">${r.project}</span>` : '';
+                        return `
+                        <div class="card" style="margin-bottom: 10px; background: ${bgColor}; border-left: 3px solid ${borderColor};">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                                <div>
+                                    <span style="color: ${borderColor}; font-weight: bold;">${roleLabel}</span>
+                                    ${projectBadge}${methodBadge}${scoreBadge}
+                                </div>
+                                <span style="color: #666; font-size: 0.75em;">${r.timestamp}</span>
+                            </div>
+                            <div style="white-space: pre-wrap; word-break: break-word; line-height: 1.5; color: #eee;">${escapeHtml(r.content)}</div>
+                        </div>`;
+                    }).join('') || '<div class="card" style="color: #888;">No results found</div>';
+                }
             } catch (e) {
                 document.getElementById('search-status').textContent = `Error: ${e.message}`;
             }
@@ -3152,7 +3392,12 @@ def index():
                 if (data.error) {
                     document.getElementById('vector-stats').innerHTML = `<span style="color: #e94560;">Error: ${data.error}</span>`;
                 } else {
-                    document.getElementById('vector-stats').innerHTML = `Vectors: <strong>${data.total_vectors}</strong> | Mapped: <strong>${data.mapped_messages}</strong> | Dim: ${data.dimension}`;
+                    const msgStats = data.message || {};
+                    const decStats = data.decision || {};
+                    document.getElementById('vector-stats').innerHTML = `
+                        Messages: <strong>${msgStats.total_vectors || 0}</strong> |
+                        Decisions: <strong>${decStats.total_vectors || 0}</strong> |
+                        Dim: ${msgStats.dimension || 768}`;
                 }
             } catch (e) {
                 document.getElementById('vector-stats').innerHTML = `<span style="color: #e94560;">Failed to load</span>`;
@@ -3164,30 +3409,64 @@ def index():
                 alert('Please select a project first');
                 return;
             }
-            if (!confirm('This will clear and rebuild all vector embeddings.\\nThis may take a while for large projects.\\n\\nContinue?')) {
+            if (!confirm('This will clear and rebuild all MESSAGE vector embeddings.\\nThis may take a while for large projects.\\n\\nContinue?')) {
                 return;
             }
             const btn = event.target;
             btn.disabled = true;
             btn.textContent = 'Rebuilding...';
-            document.getElementById('vector-stats').innerHTML = '<span style="color: #d9a04a;">Rebuilding...</span>';
+            document.getElementById('vector-stats').innerHTML = '<span style="color: #d9a04a;">Rebuilding messages...</span>';
 
             try {
                 const res = await fetch(`/api/projects/${currentProject}/vectors/rebuild`, {method: 'POST'});
                 const data = await res.json();
                 btn.disabled = false;
-                btn.textContent = 'Rebuild Vectors';
+                btn.textContent = 'Rebuild Messages';
 
                 if (data.error) {
                     alert('Error: ' + data.error);
                     loadVectorStats();
                 } else {
-                    document.getElementById('vector-stats').innerHTML = `<span style="color: #4ad9a0;">✓ Rebuilt ${data.rebuilt}/${data.total_messages} vectors</span>`;
+                    document.getElementById('vector-stats').innerHTML = `<span style="color: #4ad9a0;">✓ Rebuilt ${data.rebuilt}/${data.total_messages} message vectors</span>`;
                     setTimeout(loadVectorStats, 2000);
                 }
             } catch (e) {
                 btn.disabled = false;
-                btn.textContent = 'Rebuild Vectors';
+                btn.textContent = 'Rebuild Messages';
+                alert('Failed to rebuild: ' + e.message);
+                loadVectorStats();
+            }
+        }
+
+        async function rebuildDecisionVectors() {
+            if (!currentProject) {
+                alert('Please select a project first');
+                return;
+            }
+            if (!confirm('This will clear and rebuild all DECISION vector embeddings.\\n\\nContinue?')) {
+                return;
+            }
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Rebuilding...';
+            document.getElementById('vector-stats').innerHTML = '<span style="color: #d9a04a;">Rebuilding decisions...</span>';
+
+            try {
+                const res = await fetch(`/api/projects/${currentProject}/vectors/rebuild-decisions`, {method: 'POST'});
+                const data = await res.json();
+                btn.disabled = false;
+                btn.textContent = 'Rebuild Decisions';
+
+                if (data.error) {
+                    alert('Error: ' + data.error);
+                    loadVectorStats();
+                } else {
+                    document.getElementById('vector-stats').innerHTML = `<span style="color: #4ad9a0;">✓ Rebuilt ${data.rebuilt}/${data.total_decisions} decision vectors</span>`;
+                    setTimeout(loadVectorStats, 2000);
+                }
+            } catch (e) {
+                btn.disabled = false;
+                btn.textContent = 'Rebuild Decisions';
                 alert('Failed to rebuild: ' + e.message);
                 loadVectorStats();
             }

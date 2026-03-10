@@ -7,7 +7,7 @@ from .long_term import LongTermMemory
 from .summarizer import SummaryGenerator
 from .retriever import MemoryRetriever
 from .llm_client import create_llm_client, LLMClient
-from .models import Message, Summary
+from .models import Message, Summary, Decision
 from .embedding_client import EmbeddingClient
 from .vector_store import VectorStore
 from .knowledge_extractor import KnowledgeExtractor
@@ -101,12 +101,14 @@ class MemoryManager:
         self.enable_vector_search = enable_vector_search
         self.embedding_client = None
         self.vector_store = None
+        self.decision_vector_store = None
         if enable_vector_search:
             try:
                 # 使用 embedding_base_url，如果为空则回退到 ollama_base_url
                 embed_url = embedding_base_url if embedding_base_url else ollama_base_url
                 self.embedding_client = EmbeddingClient(model=embedding_model, base_url=embed_url)
-                self.vector_store = VectorStore(self.db_path, dimension=self.embedding_client.dimension)
+                self.vector_store = VectorStore(self.db_path, dimension=self.embedding_client.dimension, store_type="message")
+                self.decision_vector_store = VectorStore(self.db_path, dimension=self.embedding_client.dimension, store_type="decision")
                 logger.info(f"Vector search enabled: model={embedding_model}, url={embed_url}")
             except Exception as e:
                 logger.warning(f"Failed to initialize vector search: {e}")
@@ -367,3 +369,67 @@ class MemoryManager:
             context["knowledge"] = knowledge
 
         return context
+
+    # ==================== Decision 搜索相关方法 ====================
+
+    def index_pending_decisions(self) -> int:
+        """为尚未索引的 Decision 生成 embedding"""
+        if not self.enable_vector_search or not self.embedding_client or not self.decision_vector_store:
+            return 0
+
+        indexed_ids = self.decision_vector_store.get_indexed_ids()
+        decisions = self.db.get_decisions(status="confirmed", limit=200)
+
+        count = 0
+        db_name = self.db_path.stem
+        source_tag = "[Global]" if "global" in db_name.lower() else f"[{db_name}]"
+
+        for decision in decisions:
+            if decision.id in indexed_ids:
+                continue
+
+            try:
+                # 将 problem + solution 组合作为 embedding 内容
+                content = f"{decision.problem}\n{decision.solution}"
+                if decision.reason:
+                    content += f"\n{decision.reason}"
+                publish_event("embedding", f"{source_tag} Decision #{decision.id}", "")
+                embedding = self.embedding_client.embed(content)
+                self.decision_vector_store.add(decision.id, embedding)
+                count += 1
+                logger.debug(f"Decision {decision.id} indexed")
+            except Exception as e:
+                logger.warning(f"Failed to index decision {decision.id}: {e}")
+
+        if count > 0:
+            logger.info(f"Indexed {count} pending decisions")
+        return count
+
+    def decision_vector_search(self, query: str, k: int = 10) -> list[tuple[Decision, float]]:
+        """使用向量相似度搜索 Decision"""
+        if not self.enable_vector_search or not self.embedding_client or not self.decision_vector_store:
+            logger.warning("Decision vector search not available")
+            return []
+
+        # 自动索引尚未索引的 decisions
+        self.index_pending_decisions()
+
+        try:
+            query_embedding = self.embedding_client.embed(query)
+            results = self.decision_vector_store.search(query_embedding, k=k)
+
+            decisions_with_scores = []
+            for decision_id, score in results:
+                decision = self.db.get_decision_by_id(decision_id)
+                if decision and decision.status == "confirmed":
+                    decisions_with_scores.append((decision, score))
+
+            logger.info(f"Decision vector search for '{query[:50]}...': {len(decisions_with_scores)} results")
+            return decisions_with_scores
+        except Exception as e:
+            logger.error(f"Decision vector search failed: {e}")
+            return []
+
+    def decision_bm25_search(self, query: str, limit: int = 20) -> list[tuple[Decision, float]]:
+        """使用 BM25 算法搜索 Decision"""
+        return self.retriever.decision_bm25_search(query, limit)
