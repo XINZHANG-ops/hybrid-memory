@@ -163,6 +163,22 @@ class Database:
             synced = self._sync_extraction_flags(conn)
             if synced:
                 logger.info(f"Migrating: synced {synced} messages' extraction flags from is_summarized")
+            # Migration: add message_range columns to knowledge_history if not exists
+            try:
+                conn.execute("SELECT message_range_start FROM knowledge_history LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("Migrating: adding message_range columns to knowledge_history table")
+                conn.execute("ALTER TABLE knowledge_history ADD COLUMN message_range_start INTEGER")
+                conn.execute("ALTER TABLE knowledge_history ADD COLUMN message_range_end INTEGER")
+                conn.execute("ALTER TABLE knowledge_history ADD COLUMN message_count INTEGER DEFAULT 0")
+            # Migration: add message_range columns to decisions if not exists
+            try:
+                conn.execute("SELECT message_range_start FROM decisions LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("Migrating: adding message_range columns to decisions table")
+                conn.execute("ALTER TABLE decisions ADD COLUMN message_range_start INTEGER")
+                conn.execute("ALTER TABLE decisions ADD COLUMN message_range_end INTEGER")
+                conn.execute("ALTER TABLE decisions ADD COLUMN message_count INTEGER DEFAULT 0")
         logger.debug("Schema initialization complete")
 
     def _sync_extraction_flags(self, conn) -> int:
@@ -233,6 +249,17 @@ class Database:
                 "UPDATE sessions SET is_active = 0 WHERE session_id = ?", (session_id,)
             )
         logger.info(f"Session ended: {session_id}")
+
+    def delete_empty_sessions(self) -> int:
+        """删除没有消息的空 session，返回删除数量"""
+        logger.debug("Deleting empty sessions")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """DELETE FROM sessions WHERE session_id NOT IN (SELECT DISTINCT session_id FROM messages)"""
+            )
+            deleted = cursor.rowcount
+        logger.info(f"Deleted {deleted} empty sessions")
+        return deleted
 
     def add_message(self, message: Message) -> Message:
         logger.debug(f"Adding message: session={message.session_id}, role={message.role}, tokens={message.token_count}, model={message.model}")

@@ -30,6 +30,7 @@ DEFAULT_CONFIG = {
     "inject_decision_count": "5",
     # 总结管理配置
     "selected_summary_ids": "{}",  # JSON: {"project_name": [1, 3, 5], ...}
+    "selected_decision_ids": "{}",  # JSON: {"project_name": [1, 3, 5], ...}
     "summary_prompt_template": "",  # 空=使用默认模板
     # 知识提取 Prompt
     "knowledge_extraction_prompt": "",  # 空=使用默认模板

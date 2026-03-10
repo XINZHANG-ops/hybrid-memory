@@ -138,12 +138,25 @@ def get_sessions(project_name):
         return json_response({"error": "Project not found"}), 404
     db = Database(db_path)
     with db._connect() as conn:
+        # 获取每个 session 的消息数量
         rows = conn.execute(
-            "SELECT session_id, started_at, last_active_at, is_active FROM sessions ORDER BY last_active_at DESC"
+            """SELECT s.session_id, s.started_at, s.last_active_at, s.is_active,
+               (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.session_id) as msg_count
+               FROM sessions s ORDER BY s.last_active_at DESC"""
         ).fetchall()
     return json_response({
-        "sessions": [{"session_id": r[0], "started_at": str(r[1]), "last_active_at": str(r[2]), "is_active": bool(r[3])} for r in rows]
+        "sessions": [{"session_id": r[0], "started_at": str(r[1]), "last_active_at": str(r[2]), "is_active": bool(r[3]), "message_count": r[4]} for r in rows]
     })
+
+
+@app.route("/api/projects/<project_name>/sessions/cleanup", methods=["POST"])
+def cleanup_empty_sessions(project_name):
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+    db = Database(db_path)
+    deleted = db.delete_empty_sessions()
+    return json_response({"deleted": deleted, "message": f"Deleted {deleted} empty sessions"})
 
 
 @app.route("/api/projects/<project_name>/messages")
@@ -418,6 +431,35 @@ def set_summary_selection(project_name):
     return json_response({"status": "ok"})
 
 
+@app.route("/api/projects/<project_name>/decisions/selection", methods=["GET"])
+def get_decision_selection(project_name):
+    db = Database(GLOBAL_DB)
+    config_mgr = ConfigManager(db)
+    selected_config = config_mgr.get("selected_decision_ids")
+    try:
+        selected_map = json.loads(selected_config) if selected_config else {}
+    except json.JSONDecodeError:
+        selected_map = {}
+    return json_response({"selected_ids": selected_map.get(project_name, [])})
+
+
+@app.route("/api/projects/<project_name>/decisions/selection", methods=["POST"])
+def set_decision_selection(project_name):
+    data = request.json
+    if not data or "selected_ids" not in data:
+        return json_response({"error": "selected_ids required"}), 400
+    db = Database(GLOBAL_DB)
+    config_mgr = ConfigManager(db)
+    selected_config = config_mgr.get("selected_decision_ids")
+    try:
+        selected_map = json.loads(selected_config) if selected_config else {}
+    except json.JSONDecodeError:
+        selected_map = {}
+    selected_map[project_name] = data["selected_ids"]
+    config_mgr.set("selected_decision_ids", json.dumps(selected_map))
+    return json_response({"status": "ok"})
+
+
 @app.route("/api/projects/<project_name>/context")
 def get_context(project_name):
     db_path = PROJECTS_DIR / f"{project_name}.db"
@@ -432,6 +474,7 @@ def get_context(project_name):
     inject_recent_count = config_mgr.get_int("inject_recent_count")
     inject_knowledge_count = config_mgr.get_int("inject_knowledge_count")
     inject_task_count = config_mgr.get_int("inject_task_count")
+    inject_decision_count = config_mgr.get_int("inject_decision_count")
 
     # 与 sessionStart.py 完全一致：最新 N 条 + 额外选中的
     auto_summaries = db.get_all_summaries(limit=inject_summary_count)
@@ -479,16 +522,44 @@ def get_context(project_name):
     )
 
     processed_messages = []
-    for m in reversed(recent_messages) if recent_messages else []:
+    for m in recent_messages or []:  # recent_messages 已经是旧到新排序
         processed = process_content(m.content, content_config)
         if not processed:
             continue  # 用户关闭了所有类型，跳过此消息
         processed_messages.append({"role": m.role, "content": processed})
 
+    # 获取已确认的决策（与 summaries 一致：auto + extra）
+    auto_decisions = db.get_decisions(project=project_name, status="confirmed", limit=inject_decision_count)
+    auto_decision_ids = {d.id for d in auto_decisions}
+
+    selected_decision_config = config_mgr.get("selected_decision_ids")
+    try:
+        selected_decision_map = json.loads(selected_decision_config) if selected_decision_config else {}
+    except json.JSONDecodeError:
+        selected_decision_map = {}
+    extra_decision_ids = selected_decision_map.get(project_name, [])
+
+    extra_decisions = []
+    for did in extra_decision_ids:
+        if did not in auto_decision_ids:
+            d = db.get_decision_by_id(did)
+            if d and d.status == "confirmed":
+                extra_decisions.append(d)
+
+    # 顺序：extra 在上，auto 在下（auto 是 DESC 排序，需要反转）
+    all_decisions = extra_decisions + list(reversed(auto_decisions))
+    decision_list = [{
+        "id": d.id,
+        "problem": d.problem,
+        "solution": d.solution,
+        "reason": d.reason
+    } for d in all_decisions]
+
     context = {
         "summaries": "\n\n---\n\n".join(s.summary_text for s in summaries) if summaries else "",
         "messages": processed_messages,
-        "knowledge": knowledge
+        "knowledge": knowledge,
+        "decisions": decision_list
     }
     return json_response(context)
 
@@ -1844,11 +1915,10 @@ def index():
                 <button onclick="loadDecisions()" title="Refresh decisions list">Refresh</button>
                 <button onclick="extractDecisions()" style="background: #4a90d9;" title="Extract decisions from recent conversation">Extract Now</button>
                 <button onclick="loadDecisionDebug()" style="background: #6c5ce7; color: #fff;" title="View the prompt that will be sent to LLM">View Prompt</button>
-                <button onclick="filterDecisions('pending')" id="filter-pending-btn" style="background: #e94560;">Pending</button>
-                <button onclick="filterDecisions('confirmed')" id="filter-confirmed-btn" style="background: #333;">Confirmed</button>
-                <button onclick="filterDecisions('')" id="filter-all-btn" style="background: #333;">All</button>
-                <input type="text" id="decision-search" placeholder="Search decisions..." onkeyup="searchDecisionsDebounced()" style="padding: 8px 12px; flex: 1; min-width: 200px;">
-                <span id="decisions-status" style="color: #888; font-size: 0.85em; margin-left: 10px;"></span>
+                <button onclick="saveDecisionSelection()">Save Extra Selection</button>
+                <span id="decision-selection-dirty-hint" style="color: #ffcc00; margin-left: 5px; display: none;">● Unsaved</span>
+                <span style="flex: 1;"></span>
+                <span id="decisions-status" style="color: #888; font-size: 0.85em;"></span>
             </div>
             <div id="decision-pending-info" style="color: #888; margin-bottom: 10px;"></div>
             <div id="decision-debug-panel" style="display: none; margin-bottom: 15px;">
@@ -1859,36 +1929,27 @@ def index():
                 <pre id="decision-debug-content" style="background: #1a1a2e; padding: 10px; border-radius: 5px; max-height: 400px; overflow: auto; white-space: pre-wrap; font-size: 0.85em; border: 1px solid #6c5ce7;"></pre>
             </div>
 
-            <!-- Two-column layout -->
-            <div style="display: grid; grid-template-columns: 220px 1fr; gap: 15px;">
-                <!-- Left: Decision List -->
-                <div>
-                    <h3 style="color: #00d9ff; margin-bottom: 10px;">History <span id="decision-count-label" style="color: #888; font-size: 0.8em;"></span></h3>
-                    <div id="decision-history-list" style="max-height: 500px; overflow-y: auto;"></div>
+            <!-- Pending Decisions Section -->
+            <div id="pending-decisions-section" style="margin-bottom: 20px;">
+                <h3 style="color: #e94560; margin-bottom: 10px;">Pending Decisions <span id="pending-count-label"></span></h3>
+                <div id="pending-decisions-list"></div>
+            </div>
+
+            <!-- Two-column layout for Confirmed Decisions -->
+            <div style="display: flex; gap: 20px;">
+                <div style="flex: 1;">
+                    <h3 style="color: #888; margin-bottom: 10px;">Confirmed (click to add to extras)</h3>
+                    <div id="decision-list-all" style="max-height: 60vh; overflow-y: auto;"></div>
                 </div>
-                <!-- Right: Decision Details -->
-                <div>
-                    <!-- Pending Decisions -->
-                    <div id="pending-decisions-section">
-                        <h3 style="color: #e94560; margin-bottom: 10px;">Pending Decisions <span id="pending-count-label"></span></h3>
-                        <div id="pending-decisions-list"></div>
+                <div style="flex: 1;">
+                    <h3 style="color: #00d9ff; margin-bottom: 10px;">Will Be Injected</h3>
+                    <div style="background: #1f3460; border-radius: 8px; padding: 10px; margin-bottom: 15px;">
+                        <div style="color: #e94560; font-weight: bold; margin-bottom: 8px;">➕ Extra Selected</div>
+                        <div id="decision-list-extra"></div>
                     </div>
-
-                    <!-- Decision Detail View -->
-                    <div id="decision-detail-view" style="display: none; margin-top: 20px;">
-                        <div class="card" style="border-left: 3px solid #00d9ff;">
-                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-                                <span id="decision-detail-title" style="color: #00d9ff; font-weight: bold;"></span>
-                                <button onclick="closeDecisionDetail()" style="background: #333; padding: 4px 10px;">Close</button>
-                            </div>
-                            <div id="decision-detail-content"></div>
-                        </div>
-                    </div>
-
-                    <!-- Confirmed/All Decisions (legacy, hidden when detail view is open) -->
-                    <div id="confirmed-decisions-section" style="margin-top: 20px;">
-                        <h3 style="color: #00d9ff; margin-bottom: 10px;">Confirmed Decisions</h3>
-                        <div id="confirmed-decisions-list"></div>
+                    <div style="background: #0f3460; border-radius: 8px; padding: 10px;">
+                        <div style="color: #00d9ff; font-weight: bold; margin-bottom: 8px;">📌 Latest <span id="decision-inject-count-display">N</span> (Auto)</div>
+                        <div id="decision-list-auto"></div>
                     </div>
                 </div>
             </div>
@@ -2092,6 +2153,22 @@ def index():
             let html = escapeHtml(text);
             // 代码块 ```...```
             html = html.replace(/```(\\w*)\\n([\\s\\S]*?)```/g, '<pre style="background:#1a1a2e;padding:8px;border-radius:4px;overflow-x:auto;"><code>$2</code></pre>');
+            // ASCII 表格（包含 │├└┌┐┘─ 等 box-drawing 字符的连续行）
+            html = html.replace(/((?:.*[│├└┌┐┘┬┴┼─┤╭╮╰╯]+.*\\n?)+)/g, '<pre style="background:#1a1a2e;padding:8px;border-radius:4px;overflow-x:auto;font-family:monospace;line-height:1.2;">$1</pre>');
+            // Markdown 表格 (| col | col | 格式)
+            html = html.replace(/(\\|[^\\n]+\\|\\n\\|[-:\\| ]+\\|\\n(?:\\|[^\\n]+\\|\\n?)+)/g, function(match) {
+                const lines = match.trim().split('\\n');
+                if (lines.length < 2) return match;
+                const headerCells = lines[0].split('|').filter(c => c.trim());
+                const rows = lines.slice(2).map(line => line.split('|').filter(c => c.trim()));
+                let table = '<table style="border-collapse:collapse;background:#1a1a2e;border-radius:4px;margin:8px 0;width:100%;">';
+                table += '<tr>' + headerCells.map(c => '<th style="border:1px solid #333;padding:6px 10px;color:#00d9ff;text-align:left;">' + c.trim() + '</th>').join('') + '</tr>';
+                rows.forEach(row => {
+                    table += '<tr>' + row.map(c => '<td style="border:1px solid #333;padding:6px 10px;">' + c.trim() + '</td>').join('') + '</tr>';
+                });
+                table += '</table>';
+                return table;
+            });
             // 行内代码 `...`
             html = html.replace(/`([^`]+)`/g, '<code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">$1</code>');
             // 粗体 **...**
@@ -2623,7 +2700,19 @@ def index():
                 });
                 html += '</div>';
             }
-            if (!data.summaries && (!data.messages || data.messages.length === 0) && !data.knowledge) {
+            if (data.decisions && data.decisions.length > 0) {
+                let decisionsHtml = '';
+                data.decisions.forEach(d => {
+                    let line = `<div style="margin: 5px 0;">- <strong>${escapeHtml(d.problem)}</strong> → ${escapeHtml(d.solution)}`;
+                    if (d.reason) {
+                        line += ` <span style="color: #888;">(因为: ${escapeHtml(d.reason)})</span>`;
+                    }
+                    line += '</div>';
+                    decisionsHtml += line;
+                });
+                html += `<div class="context-section"><div class="context-label">Related Decisions (${data.decisions.length}):</div><div class="summary-text">${decisionsHtml}</div></div>`;
+            }
+            if (!data.summaries && (!data.messages || data.messages.length === 0) && !data.knowledge && (!data.decisions || data.decisions.length === 0)) {
                 html += '<p style="color: #888;">No context available for this project yet.</p>';
             }
             html += '</div>';
@@ -2877,7 +2966,7 @@ def index():
                 },
                 'Inject': {
                     icon: '💉',
-                    keys: ['inject_summary_count', 'inject_recent_count', 'inject_knowledge_count', 'inject_task_count']
+                    keys: ['inject_summary_count', 'inject_recent_count', 'inject_knowledge_count', 'inject_task_count', 'inject_decision_count']
                 },
                 'Summary': {
                     icon: '📝',
@@ -2957,7 +3046,7 @@ def index():
                 'llm_provider', 'ollama_model', 'ollama_base_url', 'ollama_timeout', 'ollama_keep_alive',
                 'anthropic_model', 'embedding_model', 'embedding_base_url', 'enable_vector_search', 'enable_knowledge_extraction',
                 'input_token_price', 'output_token_price',
-                'inject_summary_count', 'inject_recent_count', 'inject_knowledge_count', 'inject_task_count',
+                'inject_summary_count', 'inject_recent_count', 'inject_knowledge_count', 'inject_task_count', 'inject_decision_count',
                 'summary_max_chars_total',
                 'content_include_thinking', 'content_include_tool', 'content_include_text',
                 'content_max_chars_thinking', 'content_max_chars_tool', 'content_max_chars_text',
@@ -3310,21 +3399,30 @@ def index():
         }
 
         // ========== Decisions Functions ==========
-        let currentDecisionFilter = 'pending';
-        let searchDecisionsTimeout = null;
-
         let allDecisions = [];
         let selectedDecisionId = null;
+        let decisionExtraSelection = [];
+        let decisionSelectionDirty = false;
+        let defaultDecisionInjectCount = 5;
 
         async function loadDecisions() {
             if (!currentProject) return;
             document.getElementById('decisions-status').textContent = 'Loading...';
 
             try {
-                const res = await fetch(`/api/projects/${currentProject}/decisions?status=${currentDecisionFilter}`);
-                const data = await res.json();
+                // 获取所有 decisions（不过滤）
+                const [decisionsRes, selRes, configRes] = await Promise.all([
+                    fetch(`/api/projects/${currentProject}/decisions?status=`),
+                    fetch(`/api/projects/${currentProject}/decisions/selection`),
+                    fetch('/api/config')
+                ]);
+                const data = await decisionsRes.json();
+                const selData = await selRes.json();
+                const configData = await configRes.json();
 
                 allDecisions = data.decisions || [];
+                defaultDecisionInjectCount = parseInt(configData.config?.inject_decision_count || configData.defaults?.inject_decision_count || 5);
+                decisionExtraSelection = selData.selected_ids || [];
 
                 // 显示消息级别的 pending 信息
                 const statusColor = data.pending_message_count > 0 ? '#ffcc00' : '#4caf50';
@@ -3347,24 +3445,15 @@ def index():
                 }
 
                 document.getElementById('pending-count-label').textContent = `(${data.pending_count})`;
-                document.getElementById('decision-count-label').textContent = `(${allDecisions.length})`;
-
-                // Render history list (sidebar)
-                renderDecisionHistoryList();
-
-                // Separate pending and confirmed
-                const pending = allDecisions.filter(d => d.status === 'pending');
-                const confirmed = allDecisions.filter(d => d.status === 'confirmed');
 
                 // Render pending decisions
+                const pending = allDecisions.filter(d => d.status === 'pending');
                 document.getElementById('pending-decisions-list').innerHTML = pending.length > 0
                     ? pending.map(d => renderPendingDecision(d)).join('')
                     : '<div style="color: #888; padding: 10px;">No pending decisions</div>';
 
-                // Render confirmed decisions
-                document.getElementById('confirmed-decisions-list').innerHTML = confirmed.length > 0
-                    ? confirmed.map(d => renderConfirmedDecision(d)).join('')
-                    : '<div style="color: #888; padding: 10px;">No confirmed decisions</div>';
+                // Render confirmed decisions with selection UI
+                renderDecisions();
 
                 document.getElementById('decisions-status').textContent = '';
             } catch (e) {
@@ -3372,145 +3461,109 @@ def index():
             }
         }
 
-        function renderDecisionHistoryList() {
-            const container = document.getElementById('decision-history-list');
-            if (allDecisions.length === 0) {
-                container.innerHTML = '<div style="color: #666; font-size: 0.85em;">No decisions yet</div>';
+        function renderDecisions() {
+            const allEl = document.getElementById('decision-list-all');
+            const autoEl = document.getElementById('decision-list-auto');
+            const extraEl = document.getElementById('decision-list-extra');
+            const countEl = document.getElementById('decision-inject-count-display');
+            if (!allEl || !autoEl || !extraEl) return;
+
+            if (countEl) countEl.textContent = defaultDecisionInjectCount;
+
+            const confirmed = allDecisions.filter(d => d.status === 'confirmed');
+            if (confirmed.length === 0) {
+                allEl.innerHTML = '<p style="color: #666;">No confirmed decisions</p>';
+                autoEl.innerHTML = '<p style="color: #666;">No decisions</p>';
+                extraEl.innerHTML = '<p style="color: #666;">None</p>';
                 return;
             }
-            // Sort by timestamp desc (newest first)
-            const sorted = [...allDecisions].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-            container.innerHTML = sorted.map(d => {
-                const statusColor = d.status === 'pending' ? '#e94560' : d.status === 'confirmed' ? '#4ad9a0' : '#888';
-                const isSelected = selectedDecisionId === d.id;
-                const bg = isSelected ? '#2a4a6a' : '#1a1a2e';
-                const border = isSelected ? '#00d9ff' : statusColor;
+
+            // Auto: latest N confirmed (sorted by timestamp DESC, so first N are latest)
+            const sortedConfirmed = [...confirmed].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+            const autoIds = new Set(sortedConfirmed.slice(0, defaultDecisionInjectCount).map(d => d.id));
+            const extraSet = new Set(decisionExtraSelection);
+
+            // 左栏：所有 confirmed，点击添加到 extra
+            allEl.innerHTML = sortedConfirmed.map(d => {
+                const isAuto = autoIds.has(d.id);
+                const isExtra = extraSet.has(d.id);
+                const isSelected = isAuto || isExtra;
+                const bgColor = isSelected ? '#0a1525' : '#16213e';
+                const borderColor = isAuto ? '#00d9ff' : (isExtra ? '#e94560' : '#333');
+                const badge = isAuto ? '<span style="background:#00d9ff;color:#000;padding:1px 4px;border-radius:3px;font-size:0.7em;margin-left:5px;">AUTO</span>' : (isExtra ? '<span style="background:#e94560;color:#fff;padding:1px 4px;border-radius:3px;font-size:0.7em;margin-left:5px;">EXTRA</span>' : '');
                 const hasRange = d.message_range_start && d.message_range_end;
                 const msgBtn = hasRange ? `<button onclick="event.stopPropagation();showSummaryMessages(0, ${d.message_range_start}, ${d.message_range_end})" style="padding: 1px 4px; font-size: 0.7em; background: #1f4068;" title="View source messages">📜</button>` : '';
-                return `<div onclick="viewDecisionDetail(${d.id})" style="padding: 8px; margin-bottom: 5px; background: ${bg}; border-radius: 6px; cursor: pointer; border-left: 3px solid ${border};">
+                return `
+                <div class="card" style="margin-bottom: 8px; padding: 8px; background: ${bgColor}; border-left: 3px solid ${borderColor}; cursor: pointer;" onclick="addDecisionExtra(${d.id})">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <span style="font-size: 0.8em; color: #00d9ff;">#${d.id}</span>
-                        <div style="display: flex; align-items: center; gap: 5px;">
-                            ${msgBtn}
-                            <span style="font-size: 0.7em; color: ${statusColor}; text-transform: uppercase;">${d.status}</span>
-                        </div>
+                        <span style="font-size: 0.8em; color: #888;">#${d.id} ${formatDateTime(d.timestamp)}${badge}</span>
+                        ${msgBtn}
                     </div>
-                    <div style="font-size: 0.75em; color: #888;">${formatDateTime(d.timestamp)}</div>
-                    <div style="font-size: 0.8em; color: #ccc; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(d.problem.substring(0, 50))}${d.problem.length > 50 ? '...' : ''}</div>
+                    <div style="margin-top: 5px; font-size: 0.85em;"><strong style="color: #00d9ff;">${escapeHtml(d.problem.substring(0, 60))}${d.problem.length > 60 ? '...' : ''}</strong></div>
+                    <div style="margin-top: 3px; font-size: 0.8em; color: #4ad9a0;">→ ${escapeHtml(d.solution.substring(0, 60))}${d.solution.length > 60 ? '...' : ''}</div>
                 </div>`;
             }).join('');
-        }
 
-        let editingDecisionId = null;
-
-        function viewDecisionDetail(id) {
-            const d = allDecisions.find(x => x.id === id);
-            if (!d) return;
-            selectedDecisionId = id;
-            editingDecisionId = null;
-            renderDecisionHistoryList();
-
-            let files = [];
-            try { files = typeof d.files === 'string' ? JSON.parse(d.files || '[]') : (d.files || []); } catch (e) {}
-            const filesHtml = files.length > 0 ? `<div style="margin-top: 10px;"><strong style="color: #888;">Files:</strong> ${files.map(f => `<code style="background: #333; padding: 2px 6px; border-radius: 3px; margin-left: 5px;">${escapeHtml(f)}</code>`).join('')}</div>` : '';
-
-            document.getElementById('decision-detail-title').innerHTML = `Decision #${d.id} (${d.status}) <button onclick="editDecisionDetail(${d.id})" style="margin-left: 10px; padding: 2px 8px; font-size: 0.8em;">Edit</button>`;
-            document.getElementById('decision-detail-content').innerHTML = `
-                <div style="margin-bottom: 12px;">
-                    <strong style="color: #00d9ff;">Problem:</strong>
-                    <div style="margin-top: 5px; color: #eee; white-space: pre-wrap;">${escapeHtml(d.problem)}</div>
-                </div>
-                <div style="margin-bottom: 12px;">
-                    <strong style="color: #4ad9a0;">Solution:</strong>
-                    <div style="margin-top: 5px; color: #eee; white-space: pre-wrap;">${escapeHtml(d.solution)}</div>
-                </div>
-                ${d.reason ? `<div style="margin-bottom: 12px;"><strong style="color: #e94560;">Reason:</strong><div style="margin-top: 5px; color: #ccc;">${escapeHtml(d.reason)}</div></div>` : ''}
-                ${d.note ? `<div style="margin-bottom: 12px;"><strong style="color: #888;">Note:</strong><div style="margin-top: 5px; color: #ccc;">${escapeHtml(d.note)}</div></div>` : ''}
-                ${filesHtml}
-                <div style="margin-top: 10px; color: #666; font-size: 0.85em;">
-                    Session: ${d.session_id || 'N/A'} | ${new Date(d.timestamp).toLocaleString()}
-                </div>
-            `;
-            document.getElementById('decision-detail-view').style.display = 'block';
-        }
-
-        function editDecisionDetail(id) {
-            const d = allDecisions.find(x => x.id === id);
-            if (!d) return;
-            editingDecisionId = id;
-
-            let reasonOptions = [];
-            try {
-                reasonOptions = typeof d.reason_options === 'string' ? JSON.parse(d.reason_options || '[]') : (d.reason_options || []);
-            } catch (e) { reasonOptions = []; }
-            const reasonRadios = reasonOptions.map((r, i) =>
-                `<label style="display: block; margin: 5px 0; cursor: pointer;">
-                    <input type="radio" name="detail-reason-${id}" value="${escapeHtml(r)}" ${d.reason === r ? 'checked' : ''}> ${escapeHtml(r)}
-                </label>`
-            ).join('');
-
-            document.getElementById('decision-detail-title').innerHTML = `Editing Decision #${d.id} <button onclick="saveDecisionDetail(${d.id})" style="margin-left: 10px; padding: 2px 8px; font-size: 0.8em; background: #4ad9a0;">Save</button> <button onclick="viewDecisionDetail(${d.id})" style="padding: 2px 8px; font-size: 0.8em; background: #333;">Cancel</button>`;
-            document.getElementById('decision-detail-content').innerHTML = `
-                <div style="margin-bottom: 12px;">
-                    <strong style="color: #00d9ff;">Problem:</strong>
-                    <div style="margin-top: 5px; color: #eee;">${escapeHtml(d.problem)}</div>
-                </div>
-                <div style="margin-bottom: 12px;">
-                    <strong style="color: #4ad9a0;">Solution:</strong>
-                    <div style="margin-top: 5px; color: #eee;">${escapeHtml(d.solution)}</div>
-                </div>
-                <div style="margin-bottom: 12px;">
-                    <strong style="color: #e94560;">Reason:</strong>
-                    <div style="margin-top: 5px;">
-                        ${reasonRadios}
-                        <label style="display: block; margin: 5px 0; cursor: pointer;">
-                            <input type="radio" name="detail-reason-${id}" value="__other__" ${reasonOptions.indexOf(d.reason) === -1 && d.reason ? 'checked' : ''}> Other:
-                            <input type="text" id="detail-reason-other-${id}" value="${reasonOptions.indexOf(d.reason) === -1 ? escapeHtml(d.reason || '') : ''}" style="margin-left: 5px; padding: 4px; background: #1a1a2e; border: 1px solid #333; color: #eee; width: 200px;">
-                        </label>
+            // 右栏 Extra: 手动选中的
+            const extraDecisions = decisionExtraSelection.map(id => confirmed.find(d => d.id === id)).filter(Boolean);
+            extraEl.innerHTML = extraDecisions.length > 0
+                ? extraDecisions.map(d => `
+                    <div class="card" style="margin-bottom: 5px; padding: 6px; background: #1a1a2e; border-left: 3px solid #e94560;">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <span style="font-size: 0.75em; color: #888;">#${d.id}</span>
+                            <button onclick="event.stopPropagation();removeDecisionExtra(${d.id})" style="padding: 1px 6px; font-size: 0.7em; background: #e94560;">✕</button>
+                        </div>
+                        <div style="font-size: 0.8em; color: #ccc; margin-top: 3px;">${escapeHtml(d.problem.substring(0, 40))}...</div>
                     </div>
-                </div>
-                <div style="margin-bottom: 12px;">
-                    <strong style="color: #888;">Note:</strong>
-                    <textarea id="detail-note-${id}" style="width: 100%; min-height: 60px; margin-top: 5px; background: #1a1a2e; color: #eee; border: 1px solid #333; border-radius: 5px; padding: 6px;">${escapeHtml(d.note || '')}</textarea>
-                </div>
-            `;
+                `).join('')
+                : '<p style="color: #666; font-size: 0.85em;">None selected</p>';
+
+            // 右栏 Auto: 最新 N 个
+            const autoDecisions = sortedConfirmed.slice(0, defaultDecisionInjectCount);
+            autoEl.innerHTML = autoDecisions.length > 0
+                ? autoDecisions.map(d => `
+                    <div class="card" style="margin-bottom: 5px; padding: 6px; background: #1a1a2e; border-left: 3px solid #00d9ff;">
+                        <div style="font-size: 0.75em; color: #888;">#${d.id} ${formatDateTime(d.timestamp)}</div>
+                        <div style="font-size: 0.8em; color: #ccc; margin-top: 3px;">${escapeHtml(d.problem.substring(0, 40))}...</div>
+                    </div>
+                `).join('')
+                : '<p style="color: #666; font-size: 0.85em;">No decisions</p>';
         }
 
-        async function saveDecisionDetail(id) {
-            const selectedRadio = document.querySelector(`input[name="detail-reason-${id}"]:checked`);
-            let reason = selectedRadio ? selectedRadio.value : '';
-            if (reason === '__other__') {
-                reason = document.getElementById(`detail-reason-other-${id}`).value.trim();
-            }
-            const note = document.getElementById(`detail-note-${id}`).value.trim();
-
-            try {
-                await fetch(`/api/projects/${currentProject}/decisions/${id}`, {
-                    method: 'PUT',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({reason, note, status: 'confirmed'})
-                });
-                // Update local cache
-                const d = allDecisions.find(x => x.id === id);
-                if (d) {
-                    d.reason = reason;
-                    d.note = note;
-                    d.status = 'confirmed';
-                }
-                viewDecisionDetail(id);
-                document.getElementById('decisions-status').textContent = 'Saved';
-                setTimeout(() => document.getElementById('decisions-status').textContent = '', 2000);
-                loadDecisions(); // Refresh lists
-            } catch (e) {
-                document.getElementById('decisions-status').textContent = 'Error: ' + e.message;
+        function addDecisionExtra(id) {
+            const confirmed = allDecisions.filter(d => d.status === 'confirmed');
+            const sortedConfirmed = [...confirmed].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+            const autoIds = new Set(sortedConfirmed.slice(0, defaultDecisionInjectCount).map(d => d.id));
+            // 不能添加 auto 的，也不能重复添加
+            if (!autoIds.has(id) && !decisionExtraSelection.includes(id)) {
+                decisionExtraSelection.push(id);
+                decisionSelectionDirty = true;
+                updateDecisionDirtyHint();
+                renderDecisions();
             }
         }
 
-        function closeDecisionDetail() {
-            selectedDecisionId = null;
-            editingDecisionId = null;
-            document.getElementById('decision-detail-view').style.display = 'none';
-            renderDecisionHistoryList();
+        function removeDecisionExtra(id) {
+            decisionExtraSelection = decisionExtraSelection.filter(x => x !== id);
+            decisionSelectionDirty = true;
+            updateDecisionDirtyHint();
+            renderDecisions();
+        }
+
+        function updateDecisionDirtyHint() {
+            const hint = document.getElementById('decision-selection-dirty-hint');
+            if (hint) hint.style.display = decisionSelectionDirty ? 'inline' : 'none';
+        }
+
+        async function saveDecisionSelection() {
+            if (!currentProject) return;
+            await fetch(`/api/projects/${currentProject}/decisions/selection`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({selected_ids: decisionExtraSelection})
+            });
+            decisionSelectionDirty = false;
+            updateDecisionDirtyHint();
         }
 
         async function extractDecisions() {
@@ -3612,22 +3665,6 @@ def index():
             `;
         }
 
-        function renderConfirmedDecision(d) {
-            return `
-                <div class="card" style="margin-bottom: 10px; border-left: 3px solid #4ad9a0;">
-                    <div style="display: flex; justify-content: space-between; align-items: flex-start;">
-                        <div style="flex: 1;">
-                            <div style="font-weight: bold; color: #00d9ff; margin-bottom: 4px;">${escapeHtml(d.problem)}</div>
-                            <div style="color: #4ad9a0; margin-bottom: 4px;">→ ${escapeHtml(d.solution)}</div>
-                            ${d.reason ? `<div style="color: #d9a04a; font-size: 0.9em;">Reason: ${escapeHtml(d.reason)}</div>` : ''}
-                            ${d.note ? `<div style="color: #888; font-size: 0.85em; margin-top: 4px; font-style: italic;">Note: ${escapeHtml(d.note)}</div>` : ''}
-                        </div>
-                        <span style="color: #666; font-size: 0.8em; white-space: nowrap;">${new Date(d.timestamp).toLocaleDateString()}</span>
-                    </div>
-                </div>
-            `;
-        }
-
         async function confirmDecision(id) {
             const selectedRadio = document.querySelector(`input[name="reason-${id}"]:checked`);
             if (!selectedRadio) {
@@ -3686,40 +3723,6 @@ def index():
                 }
             } catch (e) {
                 console.error('Error deleting decision:', e);
-            }
-        }
-
-        function filterDecisions(status) {
-            currentDecisionFilter = status;
-            // Update button styles
-            document.getElementById('filter-pending-btn').style.background = status === 'pending' ? '#e94560' : '#333';
-            document.getElementById('filter-confirmed-btn').style.background = status === 'confirmed' ? '#4ad9a0' : '#333';
-            document.getElementById('filter-all-btn').style.background = status === '' ? '#4a90d9' : '#333';
-            loadDecisions();
-        }
-
-        function searchDecisionsDebounced() {
-            clearTimeout(searchDecisionsTimeout);
-            searchDecisionsTimeout = setTimeout(searchDecisions, 300);
-        }
-
-        async function searchDecisions() {
-            const query = document.getElementById('decision-search').value.trim();
-            if (!query || !currentProject) {
-                loadDecisions();
-                return;
-            }
-
-            try {
-                const res = await fetch(`/api/projects/${currentProject}/decisions/search?q=${encodeURIComponent(query)}`);
-                const data = await res.json();
-
-                document.getElementById('pending-decisions-list').innerHTML = '<div style="color: #888; padding: 10px;">Search results:</div>';
-                document.getElementById('confirmed-decisions-list').innerHTML = data.decisions.length > 0
-                    ? data.decisions.map(d => renderConfirmedDecision(d)).join('')
-                    : '<div style="color: #888; padding: 10px;">No matching decisions</div>';
-            } catch (e) {
-                console.error('Search error:', e);
             }
         }
 

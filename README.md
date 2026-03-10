@@ -55,6 +55,24 @@ pkill -f python
 # 重启 Claude Code，Dashboard 会自动启动
 ```
 
+## 维护命令
+
+### 清理空 Session
+
+空 Session 是指 Claude Code 启动后没有发送任何消息就关闭的会话。可以用以下命令清理：
+
+**Windows (PowerShell):**
+```powershell
+cd D:\python\hybrid-memory
+.venv\Scripts\python -c "from src.memory_core.database import Database; from pathlib import Path; [print(f'Cleaned {Database(p).delete_empty_sessions()} from {p.name}') for p in Path('data/projects').glob('*.db')]"
+```
+
+**macOS/Linux:**
+```bash
+cd ~/path/to/hybrid-memory
+.venv/bin/python -c "from src.memory_core.database import Database; from pathlib import Path; [print(f'Cleaned {Database(p).delete_empty_sessions()} from {p.name}') for p in Path('data/projects').glob('*.db')]"
+```
+
 ## 目录结构
 
 ```

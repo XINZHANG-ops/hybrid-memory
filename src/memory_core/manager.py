@@ -128,10 +128,13 @@ class MemoryManager:
         logger.info("MemoryManager initialization complete")
 
     def start_session(self, session_id: str):
+        """启动会话（不创建数据库记录，等待第一条消息时才创建）"""
         logger.info(f"Starting session: {session_id}")
-        self.db.create_session(session_id)
-        # Resume 时也更新活动时间，确保时间显示为最新
-        self.db.update_session_activity(session_id)
+        # 不在这里创建 session，等 add_message 时才创建
+        # 这样避免创建空 session
+        # 如果 session 已存在（resume 场景），更新活动时间
+        if self.db.get_session(session_id):
+            self.db.update_session_activity(session_id)
 
     def add_message(self, session_id: str, role: str, content: str, model: str = "", auto_summarize: bool = True) -> Message:
         """添加消息到会话

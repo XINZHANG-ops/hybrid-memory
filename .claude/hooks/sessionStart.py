@@ -213,7 +213,8 @@ def main():
             if summaries:
                 project_context["summaries"] = "\n\n---\n\n".join(s.summary_text for s in summaries)
             if recent_messages:
-                project_context["messages"] = [{"role": m.role, "content": m.content} for m in reversed(recent_messages)]
+                # recent_messages 已经是旧到新排序，直接使用
+                project_context["messages"] = [{"role": m.role, "content": m.content} for m in recent_messages]
 
         if project_context["summaries"] or project_context["messages"]:
             logger.info(f"Found project context: summaries={len(project_context['summaries'])} chars, messages={len(project_context['messages'])}")
@@ -258,18 +259,36 @@ def main():
             output_parts.append(f"# [{project_name}] 累积知识:\n" + "\n".join(f"- {item}" for item in knowledge_items))
             logger.info(f"Found knowledge: {len(knowledge_items)} categories")
 
-        # 2.5 加载已确认的决策
+        # 2.5 加载已确认的决策（auto + extra，与 summaries 一致）
         inject_decision_count = config_mgr.get_int("inject_decision_count")
-        decisions = project_manager.db.get_decisions(project=project_name, status="confirmed", limit=inject_decision_count)
-        if decisions:
+        auto_decisions = project_manager.db.get_decisions(project=project_name, status="confirmed", limit=inject_decision_count)
+        auto_decision_ids = {d.id for d in auto_decisions}
+
+        selected_decision_config = config_mgr.get("selected_decision_ids")
+        try:
+            selected_decision_map = json.loads(selected_decision_config) if selected_decision_config else {}
+        except json.JSONDecodeError:
+            selected_decision_map = {}
+        extra_decision_ids = selected_decision_map.get(project_name, [])
+
+        extra_decisions = []
+        for did in extra_decision_ids:
+            if did not in auto_decision_ids:
+                d = project_manager.db.get_decision_by_id(did)
+                if d and d.status == "confirmed":
+                    extra_decisions.append(d)
+
+        # 顺序：extra 在上，auto 在下（auto 是 DESC 排序，需要反转）
+        all_decisions = extra_decisions + list(reversed(auto_decisions))
+        if all_decisions:
             decision_lines = []
-            for d in decisions:
+            for d in all_decisions:
                 line = f"- **{d.problem}** → {d.solution}"
                 if d.reason:
                     line += f" (因为: {d.reason})"
                 decision_lines.append(line)
             output_parts.append(f"# [{project_name}] 相关决策:\n" + "\n".join(decision_lines))
-            logger.info(f"Injecting {len(decisions)} confirmed decisions")
+            logger.info(f"Injecting {len(all_decisions)} confirmed decisions (auto={len(auto_decisions)}, extra={len(extra_decisions)})")
 
         # 3. 加载全局记忆（搜索相关内容）
         global_manager = MemoryManager(db_path=GLOBAL_DB, **config_kwargs)
