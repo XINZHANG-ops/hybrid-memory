@@ -102,13 +102,19 @@ def configure_hooks():
         print(f"ERROR: Hooks directory not found: {hooks_dir}")
         return False
 
-    # 在 Mac/Linux 上设置 hook 脚本执行权限
+    # 在 Mac/Linux 上设置执行权限
     if sys.platform != "win32":
         import stat
+        # hook 脚本权限
         for py_file in hooks_dir.glob("*.py"):
             current_mode = py_file.stat().st_mode
             py_file.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        print(f"Set execute permissions for hook scripts")
+        # venv python 权限
+        venv_python = VENV_DIR / "bin" / "python"
+        if venv_python.exists():
+            current_mode = venv_python.stat().st_mode
+            venv_python.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        print(f"Set execute permissions for hook scripts and venv python")
 
     # 读取现有配置
     settings = {}
@@ -238,6 +244,7 @@ To uninstall hooks:
 
 If hooks fail with "permission denied", run:
    chmod +x {hooks_dir}/*.py
+   chmod +x {VENV_DIR}/bin/python
 """)
 
     print("=" * 60)
