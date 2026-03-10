@@ -10,13 +10,6 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from datetime import datetime
-
-# DEBUG: 在最开头写一个标记文件，确认 hook 是否被触发
-_debug_file = Path(__file__).parent.parent.parent / "data" / "stop_hook_debug.txt"
-_debug_file.parent.mkdir(parents=True, exist_ok=True)
-with open(_debug_file, "a") as f:
-    f.write(f"{datetime.now().isoformat()} - Stop hook started\n")
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
