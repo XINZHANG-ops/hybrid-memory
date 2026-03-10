@@ -230,6 +230,16 @@ Usage:
 To uninstall hooks:
    python install.py --uninstall
 """)
+
+    # Mac/Linux 故障排除提示
+    if sys.platform != "win32":
+        hooks_dir = PROJECT_ROOT / ".claude" / "hooks"
+        print(f"""Troubleshooting (Mac/Linux):
+
+If hooks fail with "permission denied", run:
+   chmod +x {hooks_dir}/*.py
+""")
+
     print("=" * 60)
 
 
