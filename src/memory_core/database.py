@@ -89,6 +89,9 @@ CREATE TABLE IF NOT EXISTS decisions (
     note TEXT DEFAULT '',
     files TEXT DEFAULT '[]',
     tags TEXT DEFAULT '[]',
+    message_range_start INTEGER,
+    message_range_end INTEGER,
+    message_count INTEGER DEFAULT 0,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
@@ -110,6 +113,9 @@ CREATE TABLE IF NOT EXISTS knowledge_history (
     id INTEGER PRIMARY KEY,
     session_id TEXT,
     content TEXT NOT NULL,
+    message_range_start INTEGER,
+    message_range_end INTEGER,
+    message_count INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -141,13 +147,34 @@ class Database:
             except sqlite3.OperationalError:
                 logger.info("Migrating: adding is_knowledge_extracted column to messages table")
                 conn.execute("ALTER TABLE messages ADD COLUMN is_knowledge_extracted BOOLEAN DEFAULT 0")
+                # 同步已总结消息的状态
+                conn.execute("UPDATE messages SET is_knowledge_extracted = 1 WHERE is_summarized = 1")
+                logger.info("Migrating: synced is_knowledge_extracted from is_summarized")
             # Migration: add is_decision_extracted column
             try:
                 conn.execute("SELECT is_decision_extracted FROM messages LIMIT 1")
             except sqlite3.OperationalError:
                 logger.info("Migrating: adding is_decision_extracted column to messages table")
                 conn.execute("ALTER TABLE messages ADD COLUMN is_decision_extracted BOOLEAN DEFAULT 0")
+                # 同步已总结消息的状态
+                conn.execute("UPDATE messages SET is_decision_extracted = 1 WHERE is_summarized = 1")
+                logger.info("Migrating: synced is_decision_extracted from is_summarized")
+            # Migration: sync existing summarized messages (for databases that already have the columns)
+            synced = self._sync_extraction_flags(conn)
+            if synced:
+                logger.info(f"Migrating: synced {synced} messages' extraction flags from is_summarized")
         logger.debug("Schema initialization complete")
+
+    def _sync_extraction_flags(self, conn) -> int:
+        """同步 is_summarized=1 但 is_knowledge_extracted=0 或 is_decision_extracted=0 的消息"""
+        cursor = conn.execute(
+            """UPDATE messages SET
+               is_knowledge_extracted = 1,
+               is_decision_extracted = 1
+               WHERE is_summarized = 1
+               AND (is_knowledge_extracted = 0 OR is_decision_extracted = 0)"""
+        )
+        return cursor.rowcount
 
     @contextmanager
     def _connect(self):
@@ -361,6 +388,44 @@ class Database:
             logger.debug(f"Unsummarized message count for {session_id or 'ALL'}: {count}")
             return count
 
+    def count_pending_knowledge_messages(self) -> int:
+        """计数待知识提取的消息"""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE is_knowledge_extracted = 0"
+            ).fetchone()
+            return row[0]
+
+    def count_pending_decision_messages(self) -> int:
+        """计数待决策提取的消息"""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE is_decision_extracted = 0"
+            ).fetchone()
+            return row[0]
+
+    def get_last_knowledge_message_id(self) -> int:
+        """获取最后一次知识提取的消息 ID"""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(id) FROM messages WHERE is_knowledge_extracted = 1"
+            ).fetchone()
+            return row[0] or 0
+
+    def get_last_decision_message_id(self) -> int:
+        """获取最后一次决策提取的消息 ID"""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(id) FROM messages WHERE is_decision_extracted = 1"
+            ).fetchone()
+            return row[0] or 0
+
+    def get_latest_message_id(self) -> int:
+        """获取最新消息 ID"""
+        with self._connect() as conn:
+            row = conn.execute("SELECT MAX(id) FROM messages").fetchone()
+            return row[0] or 0
+
     def add_summary(self, summary: Summary) -> Summary:
         logger.debug(f"Adding summary: session={summary.session_id}, message_count={summary.message_count}")
         with self._connect() as conn:
@@ -555,14 +620,17 @@ class Database:
                         )
         logger.info(f"Knowledge saved for session {session_id}")
 
-    def save_knowledge_history(self, session_id: str | None, knowledge: dict):
+    def save_knowledge_history(self, session_id: str | None, knowledge: dict, message_ids: list[int] | None = None):
         """保存知识历史版本"""
         import json
         logger.debug(f"Saving knowledge history for session: {session_id}")
+        msg_start = min(message_ids) if message_ids else None
+        msg_end = max(message_ids) if message_ids else None
+        msg_count = len(message_ids) if message_ids else 0
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO knowledge_history (session_id, content, created_at) VALUES (?, ?, ?)",
-                (session_id, json.dumps(knowledge, ensure_ascii=False), datetime.now())
+                "INSERT INTO knowledge_history (session_id, content, message_range_start, message_range_end, message_count, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, json.dumps(knowledge, ensure_ascii=False), msg_start, msg_end, msg_count, datetime.now())
             )
         logger.info(f"Knowledge history saved for session {session_id}")
 
@@ -576,13 +644,19 @@ class Database:
                 (limit,)
             ).fetchall()
             history = []
+            keys = rows[0].keys() if rows else []
             for row in rows:
-                history.append({
+                h = {
                     "id": row["id"],
                     "session_id": row["session_id"],
                     "content": json.loads(row["content"]) if row["content"] else {},
                     "created_at": row["created_at"].isoformat() if isinstance(row["created_at"], datetime) else row["created_at"],
-                })
+                }
+                if "message_range_start" in keys:
+                    h["message_range_start"] = row["message_range_start"]
+                    h["message_range_end"] = row["message_range_end"]
+                    h["message_count"] = row["message_count"]
+                history.append(h)
             logger.debug(f"Retrieved {len(history)} knowledge history records")
             return history
 
@@ -738,8 +812,8 @@ class Database:
         logger.debug(f"Adding decision: project={decision.project}, problem={decision.problem[:50]}...")
         with self._connect() as conn:
             cursor = conn.execute(
-                """INSERT INTO decisions (project, session_id, problem, solution, status, reason, reason_options, note, files, tags, timestamp)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO decisions (project, session_id, problem, solution, status, reason, reason_options, note, files, tags, message_range_start, message_range_end, message_count, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     decision.project,
                     decision.session_id,
@@ -751,6 +825,9 @@ class Database:
                     decision.note,
                     decision.files,
                     decision.tags,
+                    decision.message_range_start,
+                    decision.message_range_end,
+                    decision.message_count,
                     decision.timestamp,
                 ),
             )
@@ -853,6 +930,7 @@ class Database:
             return decisions
 
     def _row_to_decision(self, row: sqlite3.Row) -> Decision:
+        keys = row.keys()
         return Decision(
             id=row["id"],
             project=row["project"],
@@ -865,5 +943,8 @@ class Database:
             note=row["note"] or "",
             files=row["files"] or "[]",
             tags=row["tags"] or "[]",
+            message_range_start=row["message_range_start"] if "message_range_start" in keys else None,
+            message_range_end=row["message_range_end"] if "message_range_end" in keys else None,
+            message_count=row["message_count"] if "message_count" in keys else 0,
             timestamp=row["timestamp"] if isinstance(row["timestamp"], datetime) else datetime.fromisoformat(row["timestamp"]),
         )

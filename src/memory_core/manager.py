@@ -250,14 +250,15 @@ class MemoryManager:
                     existing_knowledge = self.db.get_knowledge()
                     knowledge = self.knowledge_extractor.extract(knowledge_messages, existing_knowledge)
                     if knowledge:
-                        # 保存知识历史版本
-                        self.db.save_knowledge_history(session_id, knowledge)
+                        # 获取消息 ID 列表
+                        message_ids = [m.id for m in knowledge_messages if m.id]
+                        # 保存知识历史版本（含消息范围）
+                        self.db.save_knowledge_history(session_id, knowledge, message_ids)
                         # 直接保存（覆盖旧知识）
                         with self.db._connect() as conn:
                             conn.execute("DELETE FROM knowledge")
                         self.db.save_knowledge(session_id, knowledge)
                         # 标记消息为已知识提取
-                        message_ids = [m.id for m in knowledge_messages if m.id]
                         if message_ids:
                             self.db.mark_messages_knowledge_extracted(message_ids)
                         total_items = sum(len(v) for v in knowledge.values())
@@ -328,14 +329,15 @@ class MemoryManager:
         existing_knowledge = self.db.get_knowledge()
         knowledge = self.knowledge_extractor.extract(messages, existing_knowledge)
 
-        # 保存知识历史版本
-        self.db.save_knowledge_history(session_id, knowledge)
+        # 获取消息 ID 列表
+        message_ids = [m.id for m in messages if m.id]
+        # 保存知识历史版本（含消息范围）
+        self.db.save_knowledge_history(session_id, knowledge, message_ids)
         # 直接保存（覆盖旧知识）
         with self.db._connect() as conn:
             conn.execute("DELETE FROM knowledge")
         self.db.save_knowledge(session_id, knowledge)
         # 标记消息为已知识提取
-        message_ids = [m.id for m in messages if m.id]
         if message_ids:
             self.db.mark_messages_knowledge_extracted(message_ids)
         return knowledge

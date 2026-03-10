@@ -62,13 +62,15 @@ def extract_decisions(project_name: str, session_id: str, project_db: Path, conf
         max_chars_text=int(config_mgr.get("content_max_chars_text") or 500),
     )
 
-    # 提取决策
+    # 获取消息 ID 列表
+    message_ids = [m.id for m in messages if m.id]
+
+    # 提取决策（传入消息 ID 以记录范围）
     decision_prompt = config_mgr.get("decision_extraction_prompt") or ""
     extractor = DecisionExtractor(llm_client, content_config, decision_prompt)
-    decisions = extractor.extract_decisions(msg_list, project_name, session_id)
+    decisions = extractor.extract_decisions(msg_list, project_name, session_id, message_ids=message_ids)
 
     # 标记消息为已决策提取
-    message_ids = [m.id for m in messages if m.id]
     if message_ids:
         db.mark_messages_decision_extracted(message_ids)
 

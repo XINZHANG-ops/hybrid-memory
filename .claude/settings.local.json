@@ -46,7 +46,8 @@
       "Bash(.venv/Scripts/pip install:*)",
       "Bash(cmd /c \"del \\\\?\\\\D:\\\\python\\\\hybrid-memory\\\\nul\")",
       "Bash(cmd //c \"del /f /q \"\"\\\\\\\\?\\\\D:\\\\python\\\\hybrid-memory\\\\nul\"\"\")",
-      "Bash(Select-Object -Last 50)"
+      "Bash(Select-Object -Last 50)",
+      "Bash(node --check:*)"
     ]
   }
 }

@@ -34,7 +34,8 @@ class DecisionExtractor:
         messages: list,
         project: str,
         session_id: str,
-        max_messages: int = 20
+        max_messages: int = 20,
+        message_ids: list[int] | None = None
     ) -> list[Decision]:
         """
         从消息中提取所有决策（可能 0 个、1 个或多个）
@@ -44,6 +45,7 @@ class DecisionExtractor:
             project: 项目名称
             session_id: 会话 ID
             max_messages: 分析的最大消息数
+            message_ids: 消息 ID 列表（用于记录消息范围）
 
         Returns:
             Decision 对象列表（可能为空）
@@ -53,6 +55,8 @@ class DecisionExtractor:
 
         # 只取最近的消息
         recent_messages = messages[-max_messages:]
+        # 对应的消息 ID
+        recent_ids = message_ids[-max_messages:] if message_ids else None
 
         # 格式化对话
         conversation = self._format_conversation(recent_messages)
@@ -85,6 +89,9 @@ class DecisionExtractor:
             # 创建 Decision 对象列表
             decisions = []
             now = datetime.now()
+            msg_start = min(recent_ids) if recent_ids else None
+            msg_end = max(recent_ids) if recent_ids else None
+            msg_count = len(recent_ids) if recent_ids else 0
             for item in decisions_data:
                 if not item.get("problem") or not item.get("solution"):
                     continue
@@ -100,6 +107,9 @@ class DecisionExtractor:
                     note="",
                     files=json.dumps(item.get("files", []), ensure_ascii=False),
                     tags="[]",
+                    message_range_start=msg_start,
+                    message_range_end=msg_end,
+                    message_count=msg_count,
                     timestamp=now,
                 )
                 decisions.append(decision)

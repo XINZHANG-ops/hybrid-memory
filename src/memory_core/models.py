@@ -77,4 +77,7 @@ class Decision:
     note: str = ""                # 用户补充说明
     files: str = ""               # JSON array of related files
     tags: str = ""                # JSON array of tags
+    message_range_start: int | None = None
+    message_range_end: int | None = None
+    message_count: int = 0
     timestamp: datetime = field(default_factory=datetime.now)
