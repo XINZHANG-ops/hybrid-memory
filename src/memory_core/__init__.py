@@ -11,7 +11,11 @@ from .prompts import (
     CATEGORY_NAMES, ROLE_LABELS
 )
 from .events import publish_event
-from .content_processor import ContentConfig, ContentBlock, process_content, process_messages, config_from_dict
+from .content_processor import (
+    ContentConfig, ContentBlock, TouchedFile,
+    process_content, process_messages, config_from_dict,
+    extract_touched_files, format_touched_files
+)
 
 __all__ = [
     "MemoryManager", "Message", "Summary", "Session", "TokenUsage", "Interaction", "Decision", "Database",
@@ -19,5 +23,7 @@ __all__ = [
     "EmbeddingClient", "VectorStore", "KnowledgeExtractor", "DecisionExtractor", "publish_event",
     "EXTRACTION_PROMPT", "SUMMARY_PROMPT", "SUMMARY_PROMPT_WITH_CONTEXT",
     "CATEGORY_NAMES", "ROLE_LABELS",
-    "ContentConfig", "ContentBlock", "process_content", "process_messages", "config_from_dict"
+    "ContentConfig", "ContentBlock", "TouchedFile",
+    "process_content", "process_messages", "config_from_dict",
+    "extract_touched_files", "format_touched_files"
 ]

@@ -37,8 +37,6 @@ class MemoryManager:
         embedding_base_url: str = "",  # 空=使用 ollama_base_url
         enable_vector_search: bool = True,
         enable_knowledge_extraction: bool = True,
-        # 总结配置
-        summary_max_chars_total: int = 8000,
         # 知识提取配置
         knowledge_max_items_per_category: int = 10,
         # 内容处理配置
@@ -85,7 +83,6 @@ class MemoryManager:
         )
         self.summarizer = SummaryGenerator(
             self._llm,
-            max_chars_total=summary_max_chars_total,
             content_config=self.content_config,
         )
         self.long_term = LongTermMemory(

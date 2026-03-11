@@ -26,7 +26,6 @@ DEFAULT_CONFIG = {
     "inject_summary_count": "5",
     "inject_recent_count": "5",
     "inject_knowledge_count": "5",
-    "inject_task_count": "3",
     "inject_decision_count": "5",
     # 总结管理配置
     "selected_summary_ids": "{}",  # JSON: {"project_name": [1, 3, 5], ...}
@@ -36,8 +35,7 @@ DEFAULT_CONFIG = {
     "knowledge_extraction_prompt": "",  # 空=使用默认模板
     # 决策提取 Prompt
     "decision_extraction_prompt": "",  # 空=使用默认模板
-    # 总结生成配置
-    "summary_max_chars_total": "8000",
+    "decision_regenerate_prompt": "",  # 空=使用默认模板（单条重新生成）
     # 内容处理配置（用于总结、知识提取、历史注入等）
     "content_include_thinking": "false",
     "content_include_tool": "true",
@@ -206,15 +204,6 @@ CONFIG_META = {
         "max": 20,
         "group": "Inject",
     },
-    "inject_task_count": {
-        "label": "注入待办项数量",
-        "description": "注入时显示的待办事项数量",
-        "tooltip": "注入结构化知识中的「待办事项」类别时，最多显示多少条。待办事项通常是从对话中提取的未完成任务。影响模块：sessionStart hook",
-        "type": "number",
-        "min": 1,
-        "max": 10,
-        "group": "Inject",
-    },
     "inject_decision_count": {
         "label": "注入决策数量",
         "description": "会话启动时注入的决策记录数量",
@@ -234,26 +223,23 @@ CONFIG_META = {
     "knowledge_extraction_prompt": {
         "label": "知识提取 Prompt",
         "description": "自定义知识提取的 prompt 模板",
-        "tooltip": "可用变量：{existing_knowledge}（已有知识）、{conversation}（当前对话）、{max_items}（每类最大条目数）。留空则使用系统默认模板。输出需为 JSON 格式，包含 user_preferences、project_decisions、key_facts、pending_tasks、learned_patterns、important_context 六个数组字段。",
+        "tooltip": "可用变量：{existing_knowledge}（已有知识）、{conversation}（当前对话）、{max_items}（每类最大条目数）。留空则使用系统默认模板。输出需为 JSON 格式，包含 user_preferences、architecture_decisions、design_principles、learned_patterns 四个数组字段。",
         "type": "textarea",
         "group": "Advanced",
     },
     "decision_extraction_prompt": {
         "label": "决策提取 Prompt",
-        "description": "自定义决策提取的 prompt 模板",
-        "tooltip": "可用变量：{conversation}（当前对话）。留空则使用系统默认模板。输出需为 JSON 格式，包含 decisions 数组，每个决策包含 problem、solution、reason_options、files 字段。",
+        "description": "自定义决策提取的 prompt 模板（批量提取/重新生成）",
+        "tooltip": "可用变量：{conversation}（当前对话）、{touched_files}（涉及的文件）。留空则使用系统默认模板。输出需为 JSON 格式，包含 decisions 数组，每个决策包含 problem、solution、reason_options、files 字段。",
         "type": "textarea",
         "group": "Advanced",
     },
-    # 总结生成配置
-    "summary_max_chars_total": {
-        "label": "总结对话最大字符",
-        "description": "发送给 LLM 生成总结时的对话总字符数上限",
-        "tooltip": "生成摘要时，对话内容的最大总字符数。系统会从最新消息开始累加，超过此限制的早期消息会被跳过（不发送给 LLM）。较大值可以让摘要覆盖更多内容，但会增加 token 消耗。Dashboard 的 Summary Messages 弹窗会显示哪些消息被包含/跳过。",
-        "type": "number",
-        "min": 2000,
-        "max": 32000,
-        "group": "Summary",
+    "decision_regenerate_prompt": {
+        "label": "决策重新生成 Prompt",
+        "description": "单条决策重新生成的 prompt 模板",
+        "tooltip": "可用变量：{conversation}（当前对话）、{touched_files}（涉及的文件）、{original_problem}（原问题）、{original_solution}（原解决方案）。留空则使用系统默认模板。输出需为 JSON 格式，包含 problem、solution、reason_options、files 字段。",
+        "type": "textarea",
+        "group": "Advanced",
     },
     # 知识提取配置
     "knowledge_max_items_per_category": {
@@ -396,8 +382,6 @@ class ConfigManager:
             "embedding_base_url": self.get("embedding_base_url"),  # 空=使用 ollama_base_url
             "enable_vector_search": self.get("enable_vector_search").lower() == "true",
             "enable_knowledge_extraction": self.get("enable_knowledge_extraction").lower() == "true",
-            # 总结配置
-            "summary_max_chars_total": self.get_int("summary_max_chars_total"),
             # 知识提取配置
             "knowledge_max_items_per_category": self.get_int("knowledge_max_items_per_category"),
             # 内容处理配置

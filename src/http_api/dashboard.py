@@ -266,6 +266,8 @@ def get_interactions(project_name):
 
 @app.route("/api/projects/<project_name>/summaries/<int:summary_id>", methods=["PUT"])
 def update_summary(project_name, summary_id):
+    from src.memory_core.events import publish_event
+
     db_path = PROJECTS_DIR / f"{project_name}.db"
     if not db_path.exists():
         return json_response({"error": "Project not found"}), 404
@@ -274,6 +276,7 @@ def update_summary(project_name, summary_id):
         return json_response({"error": "summary_text required"}), 400
     db = Database(db_path)
     db.update_summary_text(summary_id, data["summary_text"])
+    publish_event("summary_edited", f"Summary #{summary_id} updated", project_name)
     return json_response({"status": "ok"})
 
 
@@ -473,7 +476,6 @@ def get_context(project_name):
     inject_summary_count = config_mgr.get_int("inject_summary_count")
     inject_recent_count = config_mgr.get_int("inject_recent_count")
     inject_knowledge_count = config_mgr.get_int("inject_knowledge_count")
-    inject_task_count = config_mgr.get_int("inject_task_count")
     inject_decision_count = config_mgr.get_int("inject_decision_count")
 
     # 与 sessionStart.py 完全一致：最新 N 条 + 额外选中的
@@ -501,14 +503,12 @@ def get_context(project_name):
     recent_messages = db.get_recent_messages_all_sessions(limit=inject_recent_count)
     raw_knowledge = db.get_knowledge(None)
 
-    # 与 sessionStart.py 完全一致：注入全部 6 类，并应用数量限制
+    # 与 sessionStart.py 完全一致：注入项目级知识，并应用数量限制
     knowledge = {
         "user_preferences": raw_knowledge.get("user_preferences", [])[:inject_knowledge_count],
-        "project_decisions": raw_knowledge.get("project_decisions", [])[:inject_knowledge_count],
-        "key_facts": raw_knowledge.get("key_facts", [])[:inject_knowledge_count],
-        "pending_tasks": raw_knowledge.get("pending_tasks", [])[:inject_task_count],
+        "architecture_decisions": raw_knowledge.get("architecture_decisions", [])[:inject_knowledge_count],
+        "design_principles": raw_knowledge.get("design_principles", [])[:inject_knowledge_count],
         "learned_patterns": raw_knowledge.get("learned_patterns", [])[:inject_knowledge_count],
-        "important_context": raw_knowledge.get("important_context", [])[:inject_knowledge_count],
     }
 
     # 使用 content_processor 处理消息内容（与 sessionStart.py 完全一致）
@@ -528,8 +528,10 @@ def get_context(project_name):
             continue  # 用户关闭了所有类型，跳过此消息
         processed_messages.append({"role": m.role, "content": processed})
 
-    # 获取已确认的决策（与 summaries 一致：auto + extra）
-    auto_decisions = db.get_decisions(project=project_name, status="confirmed", limit=inject_decision_count)
+    # 获取已确认的决策：按 timestamp DESC 取最新 N 个（与 Dashboard JS 一致）
+    all_confirmed = db.get_decisions(project=project_name, status="confirmed", limit=1000)
+    sorted_confirmed = sorted(all_confirmed, key=lambda d: d.timestamp, reverse=True)
+    auto_decisions = sorted_confirmed[:inject_decision_count]
     auto_decision_ids = {d.id for d in auto_decisions}
 
     selected_decision_config = config_mgr.get("selected_decision_ids")
@@ -546,13 +548,14 @@ def get_context(project_name):
             if d and d.status == "confirmed":
                 extra_decisions.append(d)
 
-    # 顺序：extra 在上，auto 在下（auto 是 DESC 排序，需要反转）
+    # 顺序：extra 在上，auto 在下（auto 已是 DESC 排序，反转为 ASC 显示）
     all_decisions = extra_decisions + list(reversed(auto_decisions))
     decision_list = [{
         "id": d.id,
         "problem": d.problem,
         "solution": d.solution,
-        "reason": d.reason
+        "reason": d.reason,
+        "files": json.loads(d.files) if isinstance(d.files, str) else (d.files or [])
     } for d in all_decisions]
 
     context = {
@@ -886,6 +889,8 @@ def get_knowledge_history(project_name):
 def update_knowledge_history(project_name, history_id):
     """更新知识历史记录"""
     import json
+    from src.memory_core.events import publish_event
+
     db_path = PROJECTS_DIR / f"{project_name}.db"
     if not db_path.exists():
         return json_response({"error": "Project not found"}), 404
@@ -897,7 +902,102 @@ def update_knowledge_history(project_name, history_id):
             "UPDATE knowledge_history SET content = ? WHERE id = ?",
             (json.dumps(content, ensure_ascii=False), history_id)
         )
+    publish_event("knowledge_edited", f"Knowledge history #{history_id} updated", project_name)
     return json_response({"status": "ok"})
+
+
+@app.route("/api/projects/<project_name>/knowledge/history/<int:history_id>/regenerate", methods=["POST"])
+def regenerate_knowledge_history(project_name, history_id):
+    """重新生成指定的知识历史记录，使用相同的消息范围"""
+    from src.memory_core.events import publish_event
+    from src.memory_core.knowledge_extractor import KnowledgeExtractor
+    from src.memory_core.llm_client import create_llm_client
+    from src.memory_core.config import load_config
+    import json as json_module
+
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+
+    db = Database(db_path)
+    config_mgr = load_config(GLOBAL_DB)
+
+    # 获取该历史记录
+    with db._connect() as conn:
+        row = conn.execute(
+            "SELECT id, message_range_start, message_range_end, message_count FROM knowledge_history WHERE id = ?",
+            (history_id,)
+        ).fetchone()
+
+    if not row:
+        return json_response({"error": "History not found"}), 404
+
+    msg_start, msg_end = row[1], row[2]
+    if not msg_start or not msg_end:
+        return json_response({"error": "History has no message range, cannot regenerate"}), 400
+
+    # 获取该范围的消息
+    messages = db.get_messages_in_range(msg_start, msg_end)
+    if not messages:
+        return json_response({"error": "No messages found in range"}), 400
+
+    publish_event("knowledge", f"Regenerating knowledge from messages #{msg_start}-#{msg_end}", project_name)
+
+    # 获取该历史记录之前的知识（找到前一条历史记录的 content）
+    with db._connect() as conn:
+        prev_row = conn.execute(
+            "SELECT content FROM knowledge_history WHERE id < ? ORDER BY id DESC LIMIT 1",
+            (history_id,)
+        ).fetchone()
+
+    existing_knowledge = json_module.loads(prev_row[0]) if prev_row and prev_row[0] else {}
+
+    # 创建 LLM 客户端和提取器
+    llm_client = create_llm_client(
+        provider=config_mgr.get("llm_provider"),
+        ollama_model=config_mgr.get("ollama_model"),
+        ollama_base_url=config_mgr.get("ollama_base_url"),
+        ollama_timeout=float(config_mgr.get("ollama_timeout") or 300),
+        ollama_keep_alive=config_mgr.get("ollama_keep_alive"),
+    )
+
+    content_config = ContentConfig(
+        include_thinking=config_mgr.get("content_include_thinking") == "true",
+        include_tool=config_mgr.get("content_include_tool") == "true",
+        include_text=config_mgr.get("content_include_text") == "true",
+        max_chars_thinking=int(config_mgr.get("content_max_chars_thinking") or 200),
+        max_chars_tool=int(config_mgr.get("content_max_chars_tool") or 300),
+        max_chars_text=int(config_mgr.get("content_max_chars_text") or 500),
+    )
+
+    max_items = config_mgr.get_int("knowledge_max_items_per_category")
+    custom_prompt = config_mgr.get("knowledge_extraction_prompt") or ""
+    extractor = KnowledgeExtractor(
+        llm_client,
+        content_config=content_config,
+        extraction_prompt=custom_prompt,
+        max_items_per_category=max_items
+    )
+
+    # 重新提取
+    knowledge = extractor.extract(messages, existing_knowledge)
+
+    # 更新该历史记录的 content
+    with db._connect() as conn:
+        conn.execute(
+            "UPDATE knowledge_history SET content = ? WHERE id = ?",
+            (json_module.dumps(knowledge, ensure_ascii=False), history_id)
+        )
+
+    publish_event("knowledge_done", f"Regenerated knowledge history #{history_id}", project_name)
+
+    return json_response({
+        "status": "ok",
+        "message": f"Regenerated knowledge from {len(messages)} messages",
+        "history_id": history_id,
+        "message_range": {"start": msg_start, "end": msg_end},
+        "total_items": sum(len(v) for v in knowledge.values()),
+    })
 
 
 @app.route("/api/projects/<project_name>/knowledge/extract", methods=["POST"])
@@ -1017,9 +1117,18 @@ def get_knowledge_debug(project_name):
     else:
         existing_str = no_knowledge_text
 
-    # 生成完整 prompt
+    # 生成完整 prompt - 检查是否使用自定义模板
     max_items = config_mgr.get_int("knowledge_max_items_per_category")
-    prompt = EXTRACTION_PROMPT.format(conversation=conversation, existing_knowledge=existing_str, max_items=max_items)
+    custom_template = config_mgr.get("knowledge_extraction_prompt") or ""
+    using_custom = False
+    if custom_template.strip():
+        try:
+            prompt = custom_template.format(conversation=conversation, existing_knowledge=existing_str, max_items=max_items)
+            using_custom = True
+        except KeyError:
+            prompt = EXTRACTION_PROMPT.format(conversation=conversation, existing_knowledge=existing_str, max_items=max_items)
+    else:
+        prompt = EXTRACTION_PROMPT.format(conversation=conversation, existing_knowledge=existing_str, max_items=max_items)
 
     # 获取 pending 信息
     latest_msg_id = db.get_latest_message_id()
@@ -1032,15 +1141,8 @@ def get_knowledge_debug(project_name):
         "latest_message_id": latest_msg_id,
         "last_knowledge_end_id": last_knowledge_id,
         "pending_count": pending_count,
-        "content_config": {
-            "include_thinking": content_config.include_thinking,
-            "include_tool": content_config.include_tool,
-            "include_text": content_config.include_text,
-            "max_chars_thinking": content_config.max_chars_thinking,
-            "max_chars_tool": content_config.max_chars_tool,
-            "max_chars_text": content_config.max_chars_text,
-        },
-        "messages": [{"id": m.id, "role": m.role, "content": c} for m in messages if (c := process_content(m.content, content_config))],
+        "using_custom_template": using_custom,
+        "messages": [{"id": m.id, "role": m.role, "content": c, "session_id": m.session_id} for m in messages if (c := process_content(m.content, content_config))],
         "formatted_conversation": conversation,
         "existing_knowledge": existing_str,
         "full_prompt": prompt,
@@ -1058,8 +1160,6 @@ def get_summary_debug(project_name):
     db = Database(db_path)
     config_mgr = load_config(GLOBAL_DB)
     custom_template = config_mgr.get("summary_prompt_template")
-    # 读取配置的截断参数
-    max_chars_total = config_mgr.get_int("summary_max_chars_total")
     content_config = ContentConfig(
         include_thinking=config_mgr.get("content_include_thinking").lower() == "true",
         include_tool=config_mgr.get("content_include_tool").lower() == "true",
@@ -1080,17 +1180,13 @@ def get_summary_debug(project_name):
     # 格式化对话 - 使用 content_processor，与 summarizer._format_conversation 一致
     from src.memory_core.prompts import ROLE_LABELS as SUMMARY_ROLE_LABELS
     lines = []
-    total_chars = 0
-    for msg in reversed(messages):
+    for msg in messages:
         role_label = SUMMARY_ROLE_LABELS.get(msg.role, msg.role)
         content = process_content(msg.content, content_config)
         if not content:
             continue  # 用户关闭了所有类型，跳过此消息
         line = f"{role_label}: {content}"
-        if total_chars + len(line) > max_chars_total:
-            break
-        lines.insert(0, line)
-        total_chars += len(line)
+        lines.append(line)
     conversation = "\n".join(lines)
 
     # 生成完整 prompt - 与 summarizer.generate 逻辑一致
@@ -1138,11 +1234,18 @@ def get_decisions(project_name):
     if not db_path.exists():
         return json_response({"error": "Project not found"}), 404
 
-    status = request.args.get("status")  # pending, confirmed, skipped
+    status = request.args.get("status")  # pending, confirmed, skipped, empty
     limit = int(request.args.get("limit", 100))
 
     db = Database(db_path)
-    decisions = db.get_decisions(project=project_name, status=status, limit=limit)
+
+    # pending 请求时同时返回 empty（占位记录）
+    if status == "pending":
+        pending_decisions = db.get_decisions(project=project_name, status="pending", limit=limit)
+        empty_decisions = db.get_decisions(project=project_name, status="empty", limit=limit)
+        decisions = pending_decisions + empty_decisions
+    else:
+        decisions = db.get_decisions(project=project_name, status=status, limit=limit)
 
     # 获取消息级别的 pending 信息
     latest_msg_id = db.get_latest_message_id()
@@ -1177,6 +1280,8 @@ def get_decisions(project_name):
 @app.route("/api/projects/<project_name>/decisions/<int:decision_id>", methods=["PUT"])
 def update_decision(project_name, decision_id):
     """更新决策（确认/跳过/添加备注）"""
+    from src.memory_core.events import publish_event
+
     db_path = PROJECTS_DIR / f"{project_name}.db"
     if not db_path.exists():
         return json_response({"error": "Project not found"}), 404
@@ -1198,6 +1303,14 @@ def update_decision(project_name, decision_id):
     if update_fields:
         success = db.update_decision(decision_id, **update_fields)
         if success:
+            # 根据状态变化发布事件
+            new_status = data.get("status")
+            if new_status == "confirmed":
+                publish_event("decision_confirmed", f"Decision #{decision_id} confirmed", project_name)
+            elif new_status == "rejected":
+                publish_event("decision_rejected", f"Decision #{decision_id} rejected", project_name)
+            elif new_status == "pending":
+                publish_event("decision_edited", f"Decision #{decision_id} moved to pending", project_name)
             return json_response({"success": True, "message": "Decision updated"})
         return json_response({"error": "Decision not found"}), 404
 
@@ -1207,6 +1320,8 @@ def update_decision(project_name, decision_id):
 @app.route("/api/projects/<project_name>/decisions/<int:decision_id>", methods=["DELETE"])
 def delete_decision(project_name, decision_id):
     """删除决策"""
+    from src.memory_core.events import publish_event
+
     db_path = PROJECTS_DIR / f"{project_name}.db"
     if not db_path.exists():
         return json_response({"error": "Project not found"}), 404
@@ -1215,8 +1330,192 @@ def delete_decision(project_name, decision_id):
     success = db.delete_decision(decision_id)
 
     if success:
+        publish_event("decision_deleted", f"Decision #{decision_id} deleted", project_name)
         return json_response({"success": True, "message": "Decision deleted"})
     return json_response({"error": "Decision not found"}), 404
+
+
+@app.route("/api/projects/<project_name>/decisions/<int:decision_id>/regenerate", methods=["POST"])
+def regenerate_single_decision(project_name, decision_id):
+    """重新生成单个决策"""
+    from src.memory_core.events import publish_event
+    from src.memory_core.decision_extractor import DecisionExtractor
+    from src.memory_core.llm_client import create_llm_client
+    from src.memory_core.config import load_config
+
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+
+    db = Database(db_path)
+    config_mgr = load_config(GLOBAL_DB)
+
+    # 获取原 decision
+    decision = db.get_decision(decision_id)
+    if not decision:
+        return json_response({"error": "Decision not found"}), 404
+
+    # 获取对应的消息
+    if decision.message_range_start and decision.message_range_end:
+        messages = db.get_messages_in_range(decision.message_range_start, decision.message_range_end)
+        message_ids = [m.id for m in messages if m.id]
+    else:
+        # 没有消息范围，使用最近的消息
+        messages = db.get_messages_for_decision(None)[-20:]
+        message_ids = [m.id for m in messages if m.id]
+
+    if not messages:
+        return json_response({"error": "No messages found for regeneration"}), 400
+
+    try:
+        # 创建 LLM 客户端
+        llm_client = create_llm_client(
+            provider=config_mgr.get("llm_provider") or "ollama",
+            ollama_model=config_mgr.get("ollama_model") or "qwen2.5:7b",
+            ollama_base_url=config_mgr.get("ollama_base_url") or "http://localhost:11434",
+            ollama_timeout=float(config_mgr.get("ollama_timeout") or 300),
+            ollama_keep_alive=config_mgr.get("ollama_keep_alive") or "10m",
+            anthropic_model=config_mgr.get("anthropic_model"),
+        )
+
+        # 创建内容处理配置
+        content_config = ContentConfig(
+            include_thinking=config_mgr.get("content_include_thinking") == "true",
+            include_tool=config_mgr.get("content_include_tool") == "true",
+            include_text=config_mgr.get("content_include_text") == "true",
+            max_chars_thinking=int(config_mgr.get("content_max_chars_thinking") or 200),
+            max_chars_tool=int(config_mgr.get("content_max_chars_tool") or 300),
+            max_chars_text=int(config_mgr.get("content_max_chars_text") or 500),
+        )
+
+        # 提取决策
+        regenerate_prompt = config_mgr.get("decision_regenerate_prompt") or ""
+        extractor = DecisionExtractor(llm_client, content_config, regenerate_prompt=regenerate_prompt)
+        msg_list = [{"role": m.role, "content": m.content} for m in messages]
+        new_decision = extractor.regenerate_single(decision, msg_list, message_ids)
+
+        if not new_decision:
+            return json_response({"error": "Failed to regenerate decision"}), 500
+
+        # 保存新决策并删除原决策（替换而非新增）
+        saved_decision = db.add_decision(new_decision)
+        db.delete_decision(decision_id)
+        publish_event("decision_regenerated", f"Regenerated decision #{decision_id} -> #{saved_decision.id}", project_name)
+
+        return json_response({
+            "status": "ok",
+            "message": f"Regenerated decision (replaced #{decision_id} with #{saved_decision.id})",
+            "original_id": decision_id,
+            "new_id": saved_decision.id,
+            "new_decision": {
+                "problem": saved_decision.problem,
+                "solution": saved_decision.solution,
+            },
+        })
+    except Exception as e:
+        return json_response({"error": str(e)}), 500
+
+
+@app.route("/api/projects/<project_name>/decisions/regenerate-batch", methods=["POST"])
+def regenerate_batch_decisions(project_name):
+    """批量重新生成同一批次的决策（相同消息范围）"""
+    from src.memory_core.events import publish_event
+    from src.memory_core.decision_extractor import DecisionExtractor
+    from src.memory_core.llm_client import create_llm_client
+    from src.memory_core.config import load_config
+
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+
+    data = request.json or {}
+    decision_id = data.get("decision_id")
+    delete_old = data.get("delete_old", False)
+
+    if not decision_id:
+        return json_response({"error": "decision_id is required"}), 400
+
+    db = Database(db_path)
+    config_mgr = load_config(GLOBAL_DB)
+
+    # 获取原 decision
+    decision = db.get_decision(decision_id)
+    if not decision:
+        return json_response({"error": "Decision not found"}), 404
+
+    if not decision.message_range_start or not decision.message_range_end:
+        return json_response({"error": "Decision has no message range, cannot batch regenerate"}), 400
+
+    # 找到同一批次的所有 decisions
+    batch_decisions = db.get_decisions_by_message_range(
+        decision.message_range_start,
+        decision.message_range_end
+    )
+
+    # 获取对应的消息
+    messages = db.get_messages_in_range(decision.message_range_start, decision.message_range_end)
+    message_ids = [m.id for m in messages if m.id]
+
+    if not messages:
+        return json_response({"error": "No messages found for regeneration"}), 400
+
+    try:
+        # 创建 LLM 客户端
+        llm_client = create_llm_client(
+            provider=config_mgr.get("llm_provider") or "ollama",
+            ollama_model=config_mgr.get("ollama_model") or "qwen2.5:7b",
+            ollama_base_url=config_mgr.get("ollama_base_url") or "http://localhost:11434",
+            ollama_timeout=float(config_mgr.get("ollama_timeout") or 300),
+            ollama_keep_alive=config_mgr.get("ollama_keep_alive") or "10m",
+            anthropic_model=config_mgr.get("anthropic_model"),
+        )
+
+        # 创建内容处理配置
+        content_config = ContentConfig(
+            include_thinking=config_mgr.get("content_include_thinking") == "true",
+            include_tool=config_mgr.get("content_include_tool") == "true",
+            include_text=config_mgr.get("content_include_text") == "true",
+            max_chars_thinking=int(config_mgr.get("content_max_chars_thinking") or 200),
+            max_chars_tool=int(config_mgr.get("content_max_chars_tool") or 300),
+            max_chars_text=int(config_mgr.get("content_max_chars_text") or 500),
+        )
+
+        # 删除旧的 decisions（可选）
+        deleted_count = 0
+        if delete_old:
+            for d in batch_decisions:
+                if db.delete_decision(d.id):
+                    deleted_count += 1
+
+        # 重新提取决策
+        decision_prompt = config_mgr.get("decision_extraction_prompt") or ""
+        extractor = DecisionExtractor(llm_client, content_config, decision_prompt)
+        msg_list = [{"role": m.role, "content": m.content} for m in messages]
+        new_decisions = extractor.extract_decisions(msg_list, project_name, "batch_regenerate", message_ids=message_ids)
+
+        # 保存新决策
+        saved_count = 0
+        for d in new_decisions:
+            d.note = f"Batch regenerated from range #{decision.message_range_start}-#{decision.message_range_end}"
+            db.add_decision(d)
+            saved_count += 1
+
+        if saved_count > 0:
+            publish_event("decision_batch_regenerated", f"Regenerated {saved_count} decisions", project_name)
+
+        return json_response({
+            "status": "ok",
+            "message": f"Batch regenerated: deleted {deleted_count}, created {saved_count} pending decisions",
+            "deleted_count": deleted_count,
+            "created_count": saved_count,
+            "original_batch_size": len(batch_decisions),
+            "message_range": {
+                "start": decision.message_range_start,
+                "end": decision.message_range_end,
+            },
+        })
+    except Exception as e:
+        return json_response({"error": str(e)}), 500
 
 
 @app.route("/api/projects/<project_name>/decisions/search")
@@ -1326,6 +1625,7 @@ def get_decision_debug(project_name):
     """获取决策提取的 prompt 预览"""
     from src.memory_core.prompts import DECISION_PROMPT
     from src.memory_core.config import load_config
+    from src.memory_core.content_processor import extract_touched_files, format_touched_files
 
     db_path = PROJECTS_DIR / f"{project_name}.db"
     if not db_path.exists():
@@ -1334,7 +1634,7 @@ def get_decision_debug(project_name):
     db = Database(db_path)
     config_mgr = load_config(GLOBAL_DB)
 
-    # 获取未进行决策提取的消息
+    # 获取未进行决策提取的消息（无数量限制，与 Knowledge 一致）
     messages = db.get_messages_for_decision(None)
 
     # 创建内容处理配置
@@ -1346,6 +1646,10 @@ def get_decision_debug(project_name):
         max_chars_tool=int(config_mgr.get("content_max_chars_tool") or 300),
         max_chars_text=int(config_mgr.get("content_max_chars_text") or 500),
     )
+
+    # 提取涉及的文件
+    touched_files = extract_touched_files(messages)
+    touched_files_str = format_touched_files(touched_files)
 
     # 格式化对话（使用 ContentConfig）
     lines = []
@@ -1361,20 +1665,141 @@ def get_decision_debug(project_name):
     # 使用自定义 prompt 或默认
     custom_prompt = config_mgr.get("decision_extraction_prompt") or ""
     prompt_template = custom_prompt if custom_prompt.strip() else DECISION_PROMPT
-    prompt = prompt_template.format(conversation=conversation)
+    prompt = prompt_template.format(conversation=conversation, touched_files=touched_files_str)
 
     # 获取 pending 信息
     latest_msg_id = db.get_latest_message_id()
     last_decision_id = db.get_last_decision_message_id()
     pending_count = db.count_pending_decision_messages()
 
+    # 是否使用自定义模板
+    using_custom = bool(custom_prompt.strip())
+
     return json_response({
         "prompt": prompt,
+        "full_prompt": prompt,
         "message_count": len(messages),
         "conversation_length": len(conversation),
+        "touched_files": touched_files_str,
+        "touched_files_count": len(touched_files),
         "latest_message_id": latest_msg_id,
         "last_decision_end_id": last_decision_id,
         "pending_count": pending_count,
+        "using_custom_template": using_custom,
+        "messages": [{"id": m.id, "role": m.role, "content": process_content(m.content, content_config), "session_id": m.session_id} for m in messages],
+    })
+
+
+@app.route("/api/decisions/files")
+def get_all_decision_files():
+    """获取所有决策涉及的文件列表（跨项目）"""
+    import json as json_module
+    all_files = set()
+
+    for db_path in PROJECTS_DIR.glob("*.db"):
+        try:
+            db = Database(db_path)
+            decisions = db.get_decisions(status="confirmed")
+            for d in decisions:
+                files = d.files if isinstance(d.files, list) else json_module.loads(d.files or "[]")
+                all_files.update(files)
+        except Exception:
+            continue
+
+    return json_response({
+        "files": sorted(all_files),
+        "count": len(all_files)
+    })
+
+
+@app.route("/api/projects/<project_name>/decisions/files")
+def get_project_decision_files(project_name):
+    """获取项目决策涉及的文件列表"""
+    import json as json_module
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+
+    db = Database(db_path)
+    decisions = db.get_decisions(status="confirmed")
+
+    all_files = set()
+    for d in decisions:
+        files = d.files if isinstance(d.files, list) else json_module.loads(d.files or "[]")
+        all_files.update(files)
+
+    return json_response({
+        "files": sorted(all_files),
+        "count": len(all_files)
+    })
+
+
+@app.route("/api/search/decisions/by-file")
+def search_decisions_by_file():
+    """按文件搜索决策"""
+    import json as json_module
+    from rapidfuzz import fuzz
+
+    file_query = request.args.get("file", "").strip()
+    scope = request.args.get("scope", "current")
+    project = request.args.get("project", "")
+    threshold = int(request.args.get("threshold", 30))
+
+    if not file_query:
+        return json_response({"error": "file parameter required"}), 400
+
+    results = []
+
+    # 确定搜索范围
+    if scope == "current" and project:
+        db_paths = [PROJECTS_DIR / f"{project}.db"]
+    else:
+        db_paths = list(PROJECTS_DIR.glob("*.db"))
+
+    for db_path in db_paths:
+        if not db_path.exists():
+            continue
+
+        project_name = db_path.stem
+        db = Database(db_path)
+        decisions = db.get_decisions(status="confirmed")
+
+        for d in decisions:
+            files = d.files if isinstance(d.files, list) else json_module.loads(d.files or "[]")
+            if not files:
+                continue
+
+            # 计算文件匹配分数（取最高）
+            max_score = 0
+            matched_file = ""
+            for f in files:
+                score = fuzz.ratio(file_query.lower(), f.lower())
+                if score > max_score:
+                    max_score = score
+                    matched_file = f
+
+            if max_score >= threshold:
+                results.append({
+                    "id": d.id,
+                    "project": project_name,
+                    "problem": d.problem,
+                    "solution": d.solution,
+                    "reason": d.reason,
+                    "files": files,
+                    "matched_file": matched_file,
+                    "score": max_score,
+                    "timestamp": d.timestamp.isoformat() if d.timestamp else ""
+                })
+
+    # 按分数降序，再按时间降序
+    results.sort(key=lambda x: (-x["score"], x["timestamp"]), reverse=False)
+    results.sort(key=lambda x: -x["score"])
+
+    return json_response({
+        "results": results[:50],
+        "total": len(results),
+        "method": "file",
+        "query": file_query
     })
 
 
@@ -1474,6 +1899,7 @@ def get_config():
             "summary_prompt_template": get_prompt("summary_with_context"),
             "knowledge_extraction_prompt": get_prompt("extraction"),
             "decision_extraction_prompt": get_prompt("decision"),
+            "decision_regenerate_prompt": get_prompt("decision_regenerate"),
         },
         "i18n": {
             "category_names": get_prompt("category_names"),
@@ -1512,6 +1938,30 @@ def get_events():
         return json_response({"events": recent})
     except:
         return json_response({"events": []})
+
+
+@app.route("/api/events", methods=["POST"])
+def post_event():
+    """记录 UI 触发的事件"""
+    import json
+    from datetime import datetime
+    data = request.get_json() or {}
+    event = {
+        "type": data.get("type", "action"),
+        "message": data.get("message", ""),
+        "details": data.get("details", ""),
+        "timestamp": datetime.now().timestamp(),
+        "time_str": datetime.now().strftime("%H:%M:%S"),
+    }
+    events_file = MEMORY_BASE / "events.json"
+    try:
+        events = json.loads(events_file.read_text(encoding="utf-8")) if events_file.exists() else []
+    except:
+        events = []
+    events.append(event)
+    events = events[-50:]  # 保留最近 50 条
+    events_file.write_text(json.dumps(events, ensure_ascii=False), encoding="utf-8")
+    return json_response({"status": "ok"})
 
 
 @app.route("/api/events/clear", methods=["POST"])
@@ -1939,12 +2389,20 @@ def index():
                             <option value="vector">Vector (Semantic)</option>
                             <option value="bm25">BM25 (Keyword)</option>
                             <option value="fuzzy">Fuzzy (Partial Match)</option>
+                            <option value="file" id="file-method-option" hidden>📁 By File</option>
                         </select>
                     </div>
                     <div id="fuzzy-options" style="display: none;">
                         <label style="color: #888; font-size: 0.9em;">Threshold:</label>
                         <input type="number" id="fuzzy-threshold" value="60" min="0" max="100" style="width: 60px; padding: 5px; margin-left: 5px;">
                     </div>
+                </div>
+                <!-- File Search (Decision only) -->
+                <div id="file-search-container" style="display: none; margin-top: 15px; position: relative;">
+                    <input type="text" id="file-search-input" placeholder="Type to search files..."
+                           oninput="onFileSearchInput()"
+                           style="width: 100%; padding: 10px;">
+                    <div id="file-suggestions" style="display: none; position: absolute; top: 100%; left: 0; right: 0; background: #1f2d3d; border: 1px solid #333; max-height: 200px; overflow-y: auto; z-index: 100;"></div>
                 </div>
             </div>
 
@@ -2042,28 +2500,31 @@ def index():
             <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px; align-items: center;">
                 <button onclick="loadKnowledge()" title="Reload current knowledge from database">Refresh</button>
                 <button onclick="extractKnowledge()" style="background: #4a90d9;" title="Extract NEW knowledge from unsummarized messages (fuses with existing)">Extract New</button>
-                <button onclick="loadKnowledgeDebug()" style="background: #6c5ce7; color: #fff;" title="View the prompt that will be sent to LLM">View Prompt</button>
                 <span id="knowledge-status" style="color: #888; font-size: 0.85em; margin-left: 10px;"></span>
+                <span style="flex: 1;"></span>
+                <button onclick="toggleKnowledgeDebug()" style="background: #1f4068; padding: 6px 12px;">🔍 Debug</button>
             </div>
-            <div id="knowledge-pending-info" style="color: #888; margin-bottom: 10px;"></div>
-            <div id="knowledge-debug-panel" style="display: none; margin-bottom: 15px;">
-                <div class="card">
+
+            <!-- Knowledge Debug Panel (collapsible) -->
+            <div id="knowledge-debug-panel" style="display: none; margin-bottom: 20px;">
+                <div class="card" style="border-left: 3px solid #6c5ce7;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                        <h3 style="margin: 0;">Knowledge Extraction Prompt</h3>
-                        <button onclick="document.getElementById('knowledge-debug-panel').style.display='none'" style="background: #e94560; color: #fff; padding: 4px 12px;">Close</button>
+                        <h3 style="margin: 0; color: #6c5ce7;">Knowledge Debug - LLM Prompt Preview</h3>
+                        <button onclick="document.getElementById('knowledge-debug-panel').style.display='none'" style="background: #333; padding: 4px 10px;">Close</button>
+                    </div>
+                    <div style="margin-bottom: 10px;">
+                        <button onclick="loadKnowledgeDebug()" style="padding: 6px 14px;">Load Prompt</button>
                     </div>
                     <div id="knowledge-debug-info" style="color: #888; margin-bottom: 10px;"></div>
-                    <div style="margin-bottom: 10px;">
-                        <h4 style="color: #00d9ff; margin-bottom: 5px;">Input Messages</h4>
-                        <div id="knowledge-debug-messages" style="max-height: 200px; overflow-y: auto;"></div>
-                    </div>
-                    <div style="margin-bottom: 10px;">
-                        <h4 style="color: #e94560; margin-bottom: 5px;">Existing Knowledge (Context)</h4>
-                        <pre id="knowledge-debug-existing" style="background: #1a1a2e; padding: 10px; border-radius: 6px; white-space: pre-wrap; font-size: 0.85em; max-height: 150px; overflow-y: auto; color: #888;"></pre>
-                    </div>
-                    <div>
-                        <h4 style="color: #00d9ff; margin-bottom: 5px;">Full Prompt</h4>
-                        <pre id="knowledge-debug-prompt" style="background: #1a1a2e; padding: 10px; border-radius: 6px; white-space: pre-wrap; font-size: 0.85em; max-height: 300px; overflow-y: auto;"></pre>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                        <div>
+                            <h4 style="color: #00d9ff; margin-bottom: 5px;">Unextracted Messages (<span id="knowledge-debug-msg-count">0</span>)</h4>
+                            <div id="knowledge-debug-messages" style="max-height: 200px; overflow-y: auto;"></div>
+                        </div>
+                        <div>
+                            <h4 style="color: #e94560; margin-bottom: 5px;">Full Prompt to LLM</h4>
+                            <pre id="knowledge-debug-prompt" style="background: #1a1a2e; padding: 10px; border-radius: 6px; white-space: pre-wrap; word-wrap: break-word; font-size: 0.8em; max-height: 200px; overflow-y: auto;"></pre>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -2083,24 +2544,16 @@ def index():
                         <ul id="k-user-preferences"></ul>
                     </div>
                     <div class="card" style="margin-top: 15px;">
-                        <h3>Project Decisions</h3>
-                        <ul id="k-project-decisions"></ul>
+                        <h3>Architecture Decisions</h3>
+                        <ul id="k-architecture-decisions"></ul>
                     </div>
                     <div class="card" style="margin-top: 15px;">
-                        <h3>Key Facts</h3>
-                        <ul id="k-key-facts"></ul>
-                    </div>
-                    <div class="card" style="margin-top: 15px;">
-                        <h3>Pending Tasks</h3>
-                        <ul id="k-pending-tasks"></ul>
+                        <h3>Design Principles</h3>
+                        <ul id="k-design-principles"></ul>
                     </div>
                     <div class="card" style="margin-top: 15px;">
                         <h3>Learned Patterns</h3>
                         <ul id="k-learned-patterns"></ul>
-                    </div>
-                    <div class="card" style="margin-top: 15px;">
-                        <h3>Important Context</h3>
-                        <ul id="k-important-context"></ul>
                     </div>
                 </div>
             </div>
@@ -2112,19 +2565,35 @@ def index():
             <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px; align-items: center;">
                 <button onclick="loadDecisions()" title="Refresh decisions list">Refresh</button>
                 <button onclick="extractDecisions()" style="background: #4a90d9;" title="Extract decisions from recent conversation">Extract Now</button>
-                <button onclick="loadDecisionDebug()" style="background: #6c5ce7; color: #fff;" title="View the prompt that will be sent to LLM">View Prompt</button>
                 <button onclick="saveDecisionSelection()">Save Extra Selection</button>
                 <span id="decision-selection-dirty-hint" style="color: #ffcc00; margin-left: 5px; display: none;">● Unsaved</span>
                 <span style="flex: 1;"></span>
                 <span id="decisions-status" style="color: #888; font-size: 0.85em;"></span>
+                <button onclick="toggleDecisionDebug()" style="background: #1f4068; padding: 6px 12px;">🔍 Debug</button>
             </div>
-            <div id="decision-pending-info" style="color: #888; margin-bottom: 10px;"></div>
-            <div id="decision-debug-panel" style="display: none; margin-bottom: 15px;">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
-                    <span style="color: #6c5ce7; font-weight: bold;">Decision Extraction Prompt Preview</span>
-                    <button onclick="document.getElementById('decision-debug-panel').style.display='none'" style="background: #333; padding: 2px 8px;">Close</button>
+
+            <!-- Decision Debug Panel (collapsible) -->
+            <div id="decision-debug-panel" style="display: none; margin-bottom: 20px;">
+                <div class="card" style="border-left: 3px solid #e94560;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <h3 style="margin: 0; color: #e94560;">Decision Debug - LLM Prompt Preview</h3>
+                        <button onclick="document.getElementById('decision-debug-panel').style.display='none'" style="background: #333; padding: 4px 10px;">Close</button>
+                    </div>
+                    <div style="margin-bottom: 10px;">
+                        <button onclick="loadDecisionDebug()" style="padding: 6px 14px;">Load Prompt</button>
+                    </div>
+                    <div id="decision-debug-info" style="color: #888; margin-bottom: 10px;"></div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                        <div>
+                            <h4 style="color: #00d9ff; margin-bottom: 5px;">Unextracted Messages (<span id="decision-debug-msg-count">0</span>)</h4>
+                            <div id="decision-debug-messages" style="max-height: 200px; overflow-y: auto;"></div>
+                        </div>
+                        <div>
+                            <h4 style="color: #e94560; margin-bottom: 5px;">Full Prompt to LLM</h4>
+                            <pre id="decision-debug-prompt" style="background: #1a1a2e; padding: 10px; border-radius: 6px; white-space: pre-wrap; word-wrap: break-word; font-size: 0.8em; max-height: 200px; overflow-y: auto;"></pre>
+                        </div>
+                    </div>
                 </div>
-                <pre id="decision-debug-content" style="background: #1a1a2e; padding: 10px; border-radius: 5px; max-height: 400px; overflow: auto; white-space: pre-wrap; font-size: 0.85em; border: 1px solid #6c5ce7;"></pre>
             </div>
 
             <!-- Pending Decisions Section -->
@@ -2164,7 +2633,6 @@ def index():
         let expandedInteractions = new Set();  // 记录已展开的交互面板 ID
         // 全局配置（从后端加载）
         let appConfig = {
-            summary_max_chars_total: 8000,
             search_result_preview_length: 500,
             dashboard_refresh_interval: 5000,
         };
@@ -2313,8 +2781,9 @@ def index():
 
             const opts = sessionsData.map(s => {
                 const timeLabel = formatTime(s.started_at);
+                const msgCount = s.message_count || 0;
                 const activeLabel = s.is_active ? ' 🟢' : '';
-                return `<option value="${s.session_id}">${timeLabel}${activeLabel}</option>`;
+                return `<option value="${s.session_id}">${timeLabel} - ${msgCount} msgs${activeLabel}</option>`;
             }).join('');
 
             const selectEl = document.getElementById('msg-session');
@@ -2457,36 +2926,121 @@ def index():
             </div>`;
         }
 
+        const MSG_COLLAPSE_THRESHOLD = 800;  // 字符阈值
+        const MSG_PREVIEW_LENGTH = 300;      // 折叠时显示的字符数
+        let expandedMessages = new Set();    // 展开的消息ID集合
+
+        function toggleMessageCollapse(msgId) {
+            if (expandedMessages.has(msgId)) {
+                expandedMessages.delete(msgId);
+            } else {
+                expandedMessages.add(msgId);
+            }
+            loadMessages();  // 重新渲染
+        }
+
+        function renderCollapsibleContent(content, msgId, isHtml = false) {
+            const isExpanded = expandedMessages.has(msgId);
+            const contentLen = content.length;
+
+            if (contentLen <= MSG_COLLAPSE_THRESHOLD) {
+                return isHtml ? content : escapeHtml(content);
+            }
+
+            if (isExpanded) {
+                return `${isHtml ? content : escapeHtml(content)}
+                    <div style="margin-top: 8px; text-align: center;">
+                        <span onclick="toggleMessageCollapse(${msgId})" style="cursor: pointer; color: #888; font-size: 0.8em; padding: 4px 12px; background: #1a1a2e; border-radius: 4px;">▲ 折叠</span>
+                    </div>`;
+            } else {
+                const preview = content.substring(0, MSG_PREVIEW_LENGTH);
+                return `${isHtml ? preview : escapeHtml(preview)}<span style="color: #666;">...</span>
+                    <div style="margin-top: 8px; text-align: center;">
+                        <span onclick="toggleMessageCollapse(${msgId})" style="cursor: pointer; color: #00d9ff; font-size: 0.8em; padding: 4px 12px; background: #1a1a2e; border-radius: 4px;">▼ 展开 (${contentLen} 字符)</span>
+                    </div>`;
+            }
+        }
+
         function renderAssistantMessage(m, prevTimestamp) {
             const parts = parseAssistantContent(m.content);
             const modelLabel = formatModelName(m.model);
             const interactions = getInteractionsForMessage(m.timestamp, prevTimestamp);
+            const isExpanded = expandedMessages.has(m.id);
+
+            // 计算总内容长度
+            const totalLength = parts.reduce((sum, p) => sum + (p.content || '').length, 0);
+            const needsCollapse = totalLength > MSG_COLLAPSE_THRESHOLD;
 
             let html = `<div style="display: flex; justify-content: flex-start; margin-bottom: 20px;">
                 <div style="max-width: 85%; width: 100%;">
-                    <div style="font-size: 0.75em; color: #e94560; margin-bottom: 8px; font-weight: bold;">${modelLabel} <span style="color: #666; font-weight: normal;">#${m.id}</span></div>`;
+                    <div style="font-size: 0.75em; color: #e94560; margin-bottom: 8px; font-weight: bold;">${modelLabel} <span style="color: #666; font-weight: normal;">#${m.id}</span>`;
+
+            // 如果需要折叠且当前是折叠状态，显示展开按钮
+            if (needsCollapse && !isExpanded) {
+                html += ` <span onclick="toggleMessageCollapse(${m.id})" style="cursor: pointer; color: #00d9ff; font-size: 0.9em; margin-left: 8px;">▼ 展开 (${totalLength} 字符)</span>`;
+            }
+            html += `</div>`;
 
             // 先显示 interactions（在消息内容之前）
             html += renderInteractions(interactions, m.id);
 
-            for (const part of parts) {
-                if (part.type === 'thinking') {
-                    html += `<div style="background: #1a2a3a; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; border-left: 3px solid #4a90d9;">
-                        <div style="font-size: 0.7em; color: #4a90d9; margin-bottom: 4px; font-weight: bold;">💭 Thinking</div>
-                        <div style="white-space: pre-wrap; word-break: break-word; line-height: 1.4; color: #9ab; font-size: 0.9em;">${renderMarkdown(part.content)}</div>
-                    </div>`;
-                } else if (part.type === 'tool') {
-                    const toolName = part.name || 'Tool';
-                    html += `<div style="background: #2a2a1a; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; border-left: 3px solid #d9a04a;">
-                        <div style="font-size: 0.7em; color: #d9a04a; margin-bottom: 4px; font-weight: bold;">🔧 ${escapeHtml(toolName)}</div>
-                        <div style="white-space: pre-wrap; word-break: break-word; line-height: 1.4; color: #cb9; font-size: 0.85em; font-family: monospace;">${escapeHtml(part.content)}</div>
-                    </div>`;
-                } else {
-                    if (part.content.trim()) {
-                        html += `<div style="background: #2d1f3d; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; border-left: 3px solid #e94560;">
-                            <div style="white-space: pre-wrap; word-break: break-word; line-height: 1.5; color: #eee;">${renderMarkdown(part.content)}</div>
+            // 如果折叠状态，只显示摘要
+            if (needsCollapse && !isExpanded) {
+                // 显示折叠预览
+                let previewLen = 0;
+                for (const part of parts) {
+                    if (previewLen >= MSG_PREVIEW_LENGTH) break;
+                    const content = part.content || '';
+                    const remainingLen = MSG_PREVIEW_LENGTH - previewLen;
+                    const displayContent = content.length > remainingLen ? content.substring(0, remainingLen) + '...' : content;
+                    previewLen += content.length;
+
+                    if (part.type === 'thinking') {
+                        html += `<div style="background: #1a2a3a; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; border-left: 3px solid #4a90d9; opacity: 0.7;">
+                            <div style="font-size: 0.7em; color: #4a90d9; margin-bottom: 4px; font-weight: bold;">💭 Thinking</div>
+                            <div style="white-space: pre-wrap; word-break: break-word; line-height: 1.4; color: #9ab; font-size: 0.9em;">${escapeHtml(displayContent)}</div>
+                        </div>`;
+                    } else if (part.type === 'tool') {
+                        const toolName = part.name || 'Tool';
+                        html += `<div style="background: #2a2a1a; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; border-left: 3px solid #d9a04a; opacity: 0.7;">
+                            <div style="font-size: 0.7em; color: #d9a04a; margin-bottom: 4px; font-weight: bold;">🔧 ${escapeHtml(toolName)}</div>
+                            <div style="white-space: pre-wrap; word-break: break-word; line-height: 1.4; color: #cb9; font-size: 0.85em; font-family: monospace;">${escapeHtml(displayContent)}</div>
+                        </div>`;
+                    } else if (displayContent.trim()) {
+                        html += `<div style="background: #2d1f3d; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; border-left: 3px solid #e94560; opacity: 0.7;">
+                            <div style="white-space: pre-wrap; word-break: break-word; line-height: 1.5; color: #eee;">${escapeHtml(displayContent)}</div>
                         </div>`;
                     }
+                    if (previewLen >= MSG_PREVIEW_LENGTH) break;
+                }
+            } else {
+                // 显示完整内容
+                for (const part of parts) {
+                    if (part.type === 'thinking') {
+                        html += `<div style="background: #1a2a3a; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; border-left: 3px solid #4a90d9;">
+                            <div style="font-size: 0.7em; color: #4a90d9; margin-bottom: 4px; font-weight: bold;">💭 Thinking</div>
+                            <div style="white-space: pre-wrap; word-break: break-word; line-height: 1.4; color: #9ab; font-size: 0.9em;">${renderMarkdown(part.content)}</div>
+                        </div>`;
+                    } else if (part.type === 'tool') {
+                        const toolName = part.name || 'Tool';
+                        html += `<div style="background: #2a2a1a; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; border-left: 3px solid #d9a04a;">
+                            <div style="font-size: 0.7em; color: #d9a04a; margin-bottom: 4px; font-weight: bold;">🔧 ${escapeHtml(toolName)}</div>
+                            <div style="white-space: pre-wrap; word-break: break-word; line-height: 1.4; color: #cb9; font-size: 0.85em; font-family: monospace;">${escapeHtml(part.content)}</div>
+                        </div>`;
+                    } else {
+                        if (part.content.trim()) {
+                            html += `<div style="background: #2d1f3d; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; border-left: 3px solid #e94560;">
+                                <div style="white-space: pre-wrap; word-break: break-word; line-height: 1.5; color: #eee;">${renderMarkdown(part.content)}</div>
+                            </div>`;
+                        }
+                    }
+                }
+
+                // 如果需要折叠且当前是展开状态，显示折叠按钮
+                if (needsCollapse) {
+                    html += `<div style="text-align: center; margin-bottom: 8px;">
+                        <span onclick="toggleMessageCollapse(${m.id})" style="cursor: pointer; color: #888; font-size: 0.8em; padding: 4px 12px; background: #1a1a2e; border-radius: 4px;">▲ 折叠</span>
+                    </div>`;
                 }
             }
 
@@ -2515,7 +3069,7 @@ def index():
                     <div style="display: flex; justify-content: flex-end; margin-bottom: 20px;">
                         <div style="max-width: 80%; background: #1a3a5c; border-radius: 12px; padding: 12px 16px; border-left: 3px solid #00d9ff;">
                             <div style="font-size: 0.75em; color: #00d9ff; margin-bottom: 6px; font-weight: bold;">You <span style="color: #666; font-weight: normal;">#${m.id}</span></div>
-                            <div style="white-space: pre-wrap; word-break: break-word; line-height: 1.5; color: #eee;">${escapeHtml(m.content)}</div>
+                            <div style="white-space: pre-wrap; word-break: break-word; line-height: 1.5; color: #eee;">${renderCollapsibleContent(m.content, m.id)}</div>
                             <div style="font-size: 0.7em; color: #666; margin-top: 8px; text-align: right;">${m.timestamp} ${m.is_summarized ? '✓ Summarized' : ''}</div>
                         </div>
                     </div>`;
@@ -2670,45 +3224,19 @@ def index():
             const data = await res.json();
             const messages = data.messages || [];
 
-            // 使用 processed_content（后端统一处理）计算哪些消息会被包含
-            const maxTotal = appConfig.summary_max_chars_total;
-            let totalChars = 0;
-            let includedCount = 0;
-
-            // 从后往前计算
-            const reversed = [...messages].reverse();
-            for (const m of reversed) {
-                const contentLen = (m.processed_content || '').length;
-                if (totalChars + contentLen > maxTotal) break;
-                totalChars += contentLen;
-                includedCount++;
-            }
-            const excludedCount = messages.length - includedCount;
-
-            let html = '';
-            if (excludedCount > 0) {
-                html += `<div style="background: #4a3000; color: #ffcc00; padding: 10px; border-radius: 8px; margin-bottom: 15px; font-size: 0.85em;">
-                    ⚠️ 前 ${excludedCount} 条消息因字符限制未包含在 summary 中（总限制 ${maxTotal} 字符）
-                </div>`;
-            }
-
-            html += messages.map((m, idx) => {
+            let html = messages.map(m => {
                 const isUser = m.role === 'user';
                 const bgColor = isUser ? '#1a3a5c' : '#2d1f3d';
                 const borderColor = isUser ? '#00d9ff' : '#e94560';
-                const isExcluded = idx < excludedCount;
                 // 使用 processed_content 作为显示内容
                 const displayContent = m.processed_content || m.content.substring(0, 200) + '...';
                 const isTruncated = m.processed_content && m.processed_content !== m.content;
-
-                const excludedStyle = isExcluded ? 'opacity: 0.4;' : '';
-                const excludedBadge = isExcluded ? '<span style="background: #666; color: #ccc; padding: 1px 4px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">未包含</span>' : '';
-                const truncatedBadge = isTruncated && !isExcluded ? '<span style="background: #3a3a1a; color: #d9d94a; padding: 1px 4px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">已简化</span>' : '';
+                const truncatedBadge = isTruncated ? '<span style="background: #3a3a1a; color: #d9d94a; padding: 1px 4px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">已简化</span>' : '';
 
                 const roleLabel = isUser ? 'You' : formatModelName(m.model);
-                return `<div style="display: flex; justify-content: ${isUser ? 'flex-end' : 'flex-start'}; margin-bottom: 10px; ${excludedStyle}">
+                return `<div style="display: flex; justify-content: ${isUser ? 'flex-end' : 'flex-start'}; margin-bottom: 10px;">
                     <div style="max-width: 90%; background: ${bgColor}; border-radius: 8px; padding: 10px; border-left: 3px solid ${borderColor};">
-                        <div style="font-size: 0.7em; color: ${borderColor}; font-weight: bold;">${roleLabel} <span style="color: #666; font-weight: normal;">#${m.id}</span>${excludedBadge}${truncatedBadge}</div>
+                        <div style="font-size: 0.7em; color: ${borderColor}; font-weight: bold;">${roleLabel} <span style="color: #666; font-weight: normal;">#${m.id}</span>${truncatedBadge}</div>
                         <div style="white-space: pre-wrap; word-break: break-word; font-size: 0.85em; color: #eee;">${escapeHtml(displayContent)}</div>
                     </div>
                 </div>`;
@@ -2799,8 +3327,9 @@ def index():
                 const data = await res.json();
                 if (data.created) {
                     loadSummaries();
+                    showStatus('Summary created', 'success');
                 } else {
-                    alert(data.message || 'No summary created');
+                    showStatus(data.message || 'No summary created', 'warning');
                 }
             } catch (e) {
                 console.error('Trigger summary error:', e);
@@ -2875,12 +3404,12 @@ def index():
             if (data.summaries) {
                 html += `<div class="context-section"><div class="context-label">Historical Summaries:</div><div class="summary-text">${escapeHtml(data.summaries)}</div></div>`;
             }
-            // 显示累积知识（与 sessionStart.py 一致：全部 6 类）
+            // 显示累积知识（4 个类别）
             if (data.knowledge) {
                 const k = data.knowledge;
                 const catNames = (window.i18n && window.i18n.category_names) || {};
                 let knowledgeHtml = '';
-                const categories = ['user_preferences', 'project_decisions', 'key_facts', 'pending_tasks', 'learned_patterns', 'important_context'];
+                const categories = ['user_preferences', 'architecture_decisions', 'design_principles', 'learned_patterns'];
                 for (const cat of categories) {
                     if (k[cat] && k[cat].length > 0) {
                         const label = catNames[cat] || cat;
@@ -2905,6 +3434,9 @@ def index():
                     if (d.reason) {
                         line += ` <span style="color: #888;">(因为: ${escapeHtml(d.reason)})</span>`;
                     }
+                    if (d.files && d.files.length > 0) {
+                        line += ` <span style="color: #4a90d9;">[文件: ${d.files.map(f => escapeHtml(f)).join(', ')}]</span>`;
+                    }
                     line += '</div>';
                     decisionsHtml += line;
                 });
@@ -2919,26 +3451,165 @@ def index():
             el.scrollTop = el.scrollHeight;
         }
 
+        let cachedDecisionFiles = [];
+
         function onSearchMethodChange() {
             const method = document.getElementById('search-method').value;
             document.getElementById('fuzzy-options').style.display = method === 'fuzzy' ? 'block' : 'none';
+            document.getElementById('file-search-container').style.display = method === 'file' ? 'block' : 'none';
+            // 隐藏普通搜索框当选择 file 方法时
+            document.getElementById('search-query').parentElement.style.display = method === 'file' ? 'none' : 'flex';
+            if (method === 'file') {
+                loadDecisionFiles();
+            }
         }
 
         function onSearchTypeChange() {
-            // 切换搜索类型时可以做一些 UI 调整
             const searchType = document.getElementById('search-type').value;
+            const fileOption = document.getElementById('file-method-option');
+            const methodSelect = document.getElementById('search-method');
+
+            // Decision 时显示 file 选项
+            fileOption.hidden = searchType !== 'decision';
+
+            // 如果切换到 message 且当前是 file 方法，切回 combined
+            if (searchType === 'message' && methodSelect.value === 'file') {
+                methodSelect.value = 'combined';
+                onSearchMethodChange();
+            }
+
             document.getElementById('search-query').placeholder = searchType === 'decision'
                 ? 'Search decisions (problem, solution, reason)...'
                 : 'Enter search query...';
         }
 
+        async function loadDecisionFiles() {
+            const scope = document.getElementById('search-scope').value;
+            let url = scope === 'current' && currentProject
+                ? `/api/projects/${encodeURIComponent(currentProject)}/decisions/files`
+                : '/api/decisions/files';
+            try {
+                const res = await fetch(url);
+                const data = await res.json();
+                cachedDecisionFiles = data.files || [];
+            } catch (e) {
+                cachedDecisionFiles = [];
+            }
+        }
+
+        function onFileSearchInput() {
+            const input = document.getElementById('file-search-input').value.toLowerCase();
+            const container = document.getElementById('file-suggestions');
+
+            if (!input) {
+                container.style.display = 'none';
+                document.getElementById('search-results').innerHTML = '';
+                document.getElementById('search-status').textContent = '';
+                return;
+            }
+
+            // Fuzzy 排序文件列表
+            const scored = cachedDecisionFiles.map(f => ({
+                file: f,
+                score: fuzzScore(input, f.toLowerCase())
+            })).filter(x => x.score > 30).sort((a, b) => b.score - a.score);
+
+            if (scored.length > 0) {
+                container.innerHTML = scored.slice(0, 10).map(x => {
+                    const safeFile = x.file.replace(/'/g, "\\\\'");
+                    return `<div onclick="selectFileAndSearch('${safeFile}')" style="padding: 8px 12px; cursor: pointer; border-bottom: 1px solid #333; display: flex; justify-content: space-between;" onmouseover="this.style.background='#2d3e50'" onmouseout="this.style.background='transparent'">
+                        <span style="color: #eee;">${escapeHtml(x.file)}</span>
+                        <span style="color: #666; font-size: 0.8em;">${x.score}%</span>
+                    </div>`;
+                }).join('');
+                container.style.display = 'block';
+            } else {
+                container.innerHTML = '<div style="padding: 8px 12px; color: #666;">No matching files</div>';
+                container.style.display = 'block';
+            }
+
+            // 实时搜索 decisions
+            doFileSearch(input);
+        }
+
+        function fuzzScore(query, target) {
+            // 简单的 fuzzy 匹配分数
+            if (target.includes(query)) return 100;
+            let score = 0, qi = 0;
+            for (let i = 0; i < target.length && qi < query.length; i++) {
+                if (target[i] === query[qi]) { score += 10; qi++; }
+            }
+            return Math.min(99, Math.round(score * query.length / Math.max(1, target.length)));
+        }
+
+        function selectFileAndSearch(file) {
+            document.getElementById('file-search-input').value = file;
+            document.getElementById('file-suggestions').style.display = 'none';
+            doFileSearch(file);
+        }
+
+        async function doFileSearch(fileQuery) {
+            if (!fileQuery) return;
+
+            const scope = document.getElementById('search-scope').value;
+            let url = `/api/search/decisions/by-file?file=${encodeURIComponent(fileQuery)}&scope=${scope}`;
+            if (scope === 'current' && currentProject) {
+                url += `&project=${encodeURIComponent(currentProject)}`;
+            }
+
+            document.getElementById('search-status').textContent = 'Searching...';
+
+            try {
+                const res = await fetch(url);
+                const data = await res.json();
+
+                document.getElementById('search-status').textContent = `Found ${data.total || 0} decisions matching "${fileQuery}"`;
+
+                document.getElementById('search-results').innerHTML = data.results.map(r => {
+                    const files = r.files || [];
+                    const projectBadge = scope === 'all' ? `<span class="badge" style="margin-left: 5px;">${r.project}</span>` : '';
+                    return `
+                    <div class="card" style="margin-bottom: 10px; background: #1f2d3d; border-left: 3px solid #6c5ce7;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                            <div>
+                                <span style="color: #6c5ce7; font-weight: bold;">Decision #${r.id}</span>
+                                ${projectBadge}
+                                <span style="color: #888; font-size: 0.8em; margin-left: 8px;">match: ${r.score}%</span>
+                            </div>
+                            <span style="color: #666; font-size: 0.75em;">${r.timestamp}</span>
+                        </div>
+                        <div style="margin-bottom: 8px;">
+                            <span style="color: #e94560; font-weight: bold;">Problem:</span>
+                            <span style="color: #eee;">${escapeHtml(r.problem)}</span>
+                        </div>
+                        <div style="margin-bottom: 8px;">
+                            <span style="color: #00d9ff; font-weight: bold;">Solution:</span>
+                            <span style="color: #eee;">${escapeHtml(r.solution)}</span>
+                        </div>
+                        ${r.reason ? `<div style="color: #888; font-size: 0.9em;"><span style="color: #d9a04a;">Reason:</span> ${escapeHtml(r.reason)}</div>` : ''}
+                        <div style="margin-top: 8px; color: #888; font-size: 0.85em;">
+                            📁 ${files.map(f => f === r.matched_file ? `<strong style="color: #4ad9a0;">${escapeHtml(f)}</strong>` : `<code>${escapeHtml(f)}</code>`).join(', ')}
+                        </div>
+                    </div>`;
+                }).join('') || '<div class="card" style="color: #888;">No decisions found</div>';
+            } catch (e) {
+                document.getElementById('search-status').textContent = 'Error: ' + e.message;
+            }
+        }
+
         async function doUnifiedSearch() {
+            const method = document.getElementById('search-method').value;
+            if (method === 'file') {
+                const fileQuery = document.getElementById('file-search-input').value;
+                doFileSearch(fileQuery);
+                return;
+            }
+
             const query = document.getElementById('search-query').value;
             if (!query) return;
 
             const searchType = document.getElementById('search-type').value;
             const scope = document.getElementById('search-scope').value;
-            const method = document.getElementById('search-method').value;
             const threshold = document.getElementById('fuzzy-threshold').value || 60;
 
             if (scope === 'current' && !currentProject) {
@@ -3206,11 +3877,7 @@ def index():
                 },
                 'Inject': {
                     icon: '💉',
-                    keys: ['inject_summary_count', 'inject_recent_count', 'inject_knowledge_count', 'inject_task_count', 'inject_decision_count']
-                },
-                'Summary': {
-                    icon: '📝',
-                    keys: ['summary_max_chars_total']
+                    keys: ['inject_summary_count', 'inject_recent_count', 'inject_knowledge_count', 'inject_decision_count']
                 },
                 'Stats': {
                     icon: '📊',
@@ -3222,7 +3889,7 @@ def index():
                 },
                 'Prompts': {
                     icon: '✏️',
-                    keys: ['prompt_language', 'summary_prompt_template', 'knowledge_extraction_prompt', 'decision_extraction_prompt']
+                    keys: ['prompt_language', 'summary_prompt_template', 'knowledge_extraction_prompt', 'decision_extraction_prompt', 'decision_regenerate_prompt']
                 }
             };
 
@@ -3286,13 +3953,12 @@ def index():
                 'llm_provider', 'ollama_model', 'ollama_base_url', 'ollama_timeout', 'ollama_keep_alive',
                 'anthropic_model', 'embedding_model', 'embedding_base_url', 'enable_vector_search', 'enable_knowledge_extraction',
                 'input_token_price', 'output_token_price',
-                'inject_summary_count', 'inject_recent_count', 'inject_knowledge_count', 'inject_task_count', 'inject_decision_count',
-                'summary_max_chars_total',
+                'inject_summary_count', 'inject_recent_count', 'inject_knowledge_count', 'inject_decision_count',
                 'content_include_thinking', 'content_include_tool', 'content_include_text',
                 'content_max_chars_thinking', 'content_max_chars_tool', 'content_max_chars_text',
                 'knowledge_max_items_per_category',
                 'search_result_preview_length', 'dashboard_refresh_interval',
-                'prompt_language', 'summary_prompt_template', 'knowledge_extraction_prompt', 'decision_extraction_prompt'
+                'prompt_language', 'summary_prompt_template', 'knowledge_extraction_prompt', 'decision_extraction_prompt', 'decision_regenerate_prompt'
             ];
             for (const key of configKeys) {
                 const el = document.getElementById(`config-${key}`);
@@ -3300,12 +3966,12 @@ def index():
                     await fetch('/api/config', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key, value: el.value})});
                 }
             }
-            alert('Settings saved!');
+            showStatus('Settings saved', 'success');
             closeConfigModal();
         }
 
         async function resetConfig() {
-            if (!confirm('Reset all settings to defaults?')) return;
+            showStatus('Resetting to defaults...', 'action');
             for (const [key, value] of Object.entries(configDefaults)) {
                 await fetch('/api/config', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key, value})});
             }
@@ -3315,6 +3981,42 @@ def index():
         function escapeHtml(text) {
             if (!text) return '';
             return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        // ========== Status Message System ==========
+        function showStatus(message, type = 'info') {
+            // 显示状态消息并记录到事件
+            const panel = document.getElementById('event-panel');
+            let icon = '📌', bgColor = '#16213e', borderColor = '#4a90d9';
+            if (type === 'success') { icon = '✅'; borderColor = '#4ad9a0'; }
+            else if (type === 'error') { icon = '❌'; borderColor = '#ff4444'; bgColor = '#2a1a1a'; }
+            else if (type === 'warning') { icon = '⚠️'; borderColor = '#d9a04a'; }
+            else if (type === 'action') { icon = '🔧'; borderColor = '#9a4ad9'; }
+
+            const toast = document.createElement('div');
+            toast.style.cssText = `
+                background: ${bgColor}; border-left: 3px solid ${borderColor};
+                padding: 10px 12px; border-radius: 6px; margin-bottom: 8px;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.4); animation: slideIn 0.3s ease;
+                font-size: 0.85em;
+            `;
+            toast.innerHTML = `<span>${icon} <strong style="color: ${borderColor};">${escapeHtml(message)}</strong></span>`;
+            panel.appendChild(toast);
+
+            // 自动移除
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateX(-20px)';
+                toast.style.transition = 'all 0.3s ease';
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+
+            // 记录到事件日志
+            fetch('/api/events', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({type, message})
+            }).catch(() => {});
         }
 
         // ========== Common UI Utilities ==========
@@ -3352,7 +4054,7 @@ def index():
 
         async function loadSummaryDebug() {
             if (!currentProject) {
-                alert('Please select a project first');
+                showStatus('Please select a project first', 'warning');
                 return;
             }
             const res = await fetch(`/api/projects/${currentProject}/summary-debug`);
@@ -3406,12 +4108,10 @@ def index():
 
         async function rebuildVectors() {
             if (!currentProject) {
-                alert('Please select a project first');
+                showStatus('Please select a project first', 'warning');
                 return;
             }
-            if (!confirm('This will clear and rebuild all MESSAGE vector embeddings.\\nThis may take a while for large projects.\\n\\nContinue?')) {
-                return;
-            }
+            showStatus('Rebuilding message vectors...', 'action');
             const btn = event.target;
             btn.disabled = true;
             btn.textContent = 'Rebuilding...';
@@ -3424,28 +4124,27 @@ def index():
                 btn.textContent = 'Rebuild Messages';
 
                 if (data.error) {
-                    alert('Error: ' + data.error);
+                    showStatus('Rebuild error: ' + data.error, 'error');
                     loadVectorStats();
                 } else {
                     document.getElementById('vector-stats').innerHTML = `<span style="color: #4ad9a0;">✓ Rebuilt ${data.rebuilt}/${data.total_messages} message vectors</span>`;
+                    showStatus(`Rebuilt ${data.rebuilt} message vectors`, 'success');
                     setTimeout(loadVectorStats, 2000);
                 }
             } catch (e) {
                 btn.disabled = false;
                 btn.textContent = 'Rebuild Messages';
-                alert('Failed to rebuild: ' + e.message);
+                showStatus('Failed to rebuild: ' + e.message, 'error');
                 loadVectorStats();
             }
         }
 
         async function rebuildDecisionVectors() {
             if (!currentProject) {
-                alert('Please select a project first');
+                showStatus('Please select a project first', 'warning');
                 return;
             }
-            if (!confirm('This will clear and rebuild all DECISION vector embeddings.\\n\\nContinue?')) {
-                return;
-            }
+            showStatus('Rebuilding decision vectors...', 'action');
             const btn = event.target;
             btn.disabled = true;
             btn.textContent = 'Rebuilding...';
@@ -3458,16 +4157,17 @@ def index():
                 btn.textContent = 'Rebuild Decisions';
 
                 if (data.error) {
-                    alert('Error: ' + data.error);
+                    showStatus('Rebuild error: ' + data.error, 'error');
                     loadVectorStats();
                 } else {
                     document.getElementById('vector-stats').innerHTML = `<span style="color: #4ad9a0;">✓ Rebuilt ${data.rebuilt}/${data.total_decisions} decision vectors</span>`;
+                    showStatus(`Rebuilt ${data.rebuilt} decision vectors`, 'success');
                     setTimeout(loadVectorStats, 2000);
                 }
             } catch (e) {
                 btn.disabled = false;
                 btn.textContent = 'Rebuild Decisions';
-                alert('Failed to rebuild: ' + e.message);
+                showStatus('Failed to rebuild: ' + e.message, 'error');
                 loadVectorStats();
             }
         }
@@ -3498,17 +4198,6 @@ def index():
             const res = await fetch(`/api/projects/${currentProject}/knowledge`);
             let data = await res.json();
             document.getElementById('knowledge-status').textContent = '';
-
-            // 显示 pending 信息
-            const statusColor = data.pending_count > 0 ? '#ffcc00' : '#4caf50';
-            document.getElementById('knowledge-pending-info').innerHTML = `
-                <div style="display: flex; flex-wrap: wrap; gap: 15px; align-items: center;">
-                    <div><strong>Latest Msg:</strong> <span style="color: #00d9ff;">#${data.latest_message_id || 0}</span></div>
-                    <div><strong>Last Extracted:</strong> <span style="color: #4caf50;">→ #${data.last_knowledge_end_id || 0}</span></div>
-                    <div><strong>Pending:</strong> <span style="color: ${statusColor}; font-weight: bold;">${data.pending_count || 0} messages</span></div>
-                </div>
-            `;
-
             selectedKnowledgeHistoryId = null;
             document.getElementById('knowledge-viewing-label').textContent = 'Current';
             renderKnowledgeContent(data.knowledge || {}, data.max_per_category || 10);
@@ -3516,8 +4205,8 @@ def index():
         }
 
         function renderKnowledgeContent(k, maxPerCategory) {
-            const categories = ['user-preferences', 'project-decisions', 'key-facts', 'pending-tasks', 'learned-patterns', 'important-context'];
-            const keys = ['user_preferences', 'project_decisions', 'key_facts', 'pending_tasks', 'learned_patterns', 'important_context'];
+            const categories = ['user-preferences', 'architecture-decisions', 'design-principles', 'learned-patterns'];
+            const keys = ['user_preferences', 'architecture_decisions', 'design_principles', 'learned_patterns'];
             for (let i = 0; i < categories.length; i++) {
                 const items = k[keys[i]] || [];
                 const badge = ` (${items.length}/${maxPerCategory})`;
@@ -3552,10 +4241,11 @@ def index():
                 const border = isSelected ? '#00d9ff' : '#333';
                 const hasRange = h.message_range_start && h.message_range_end;
                 const msgBtn = hasRange ? `<button onclick="event.stopPropagation();showSummaryMessages(0, ${h.message_range_start}, ${h.message_range_end})" style="padding: 1px 4px; font-size: 0.7em; background: #1f4068;" title="View source messages">📜</button>` : '';
+                const regenBtn = hasRange ? `<button onclick="event.stopPropagation();regenerateKnowledgeHistory(${h.id})" style="padding: 1px 4px; font-size: 0.7em; background: #333;" title="Regenerate this knowledge">🔄</button>` : '';
                 return `<div onclick="viewKnowledgeHistory(${h.id})" style="padding: 8px; margin-bottom: 5px; background: ${bg}; border-radius: 6px; cursor: pointer; border-left: 3px solid ${border};">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
                         <span style="font-size: 0.8em; color: #00d9ff;">#${h.id}</span>
-                        ${msgBtn}
+                        <div style="display: flex; gap: 3px;">${msgBtn}${regenBtn}</div>
                     </div>
                     <div style="font-size: 0.75em; color: #888;">${formatDateTime(h.created_at)}</div>
                     <div style="font-size: 0.75em; color: #666; margin-top: 3px;">${totalItems} items${h.message_count ? ` · ${h.message_count} msgs` : ''}</div>
@@ -3586,8 +4276,8 @@ def index():
         }
 
         function renderKnowledgeContentEditable(k) {
-            const categories = ['user-preferences', 'project-decisions', 'key-facts', 'pending-tasks', 'learned-patterns', 'important-context'];
-            const keys = ['user_preferences', 'project_decisions', 'key_facts', 'pending_tasks', 'learned_patterns', 'important_context'];
+            const categories = ['user-preferences', 'architecture-decisions', 'design-principles', 'learned-patterns'];
+            const keys = ['user_preferences', 'architecture_decisions', 'design_principles', 'learned_patterns'];
             for (let i = 0; i < categories.length; i++) {
                 const items = k[keys[i]] || [];
                 const textarea = `<textarea id="k-edit-${keys[i]}" style="width: 100%; min-height: 80px; background: #1a1a2e; color: #eee; border: 1px solid #333; border-radius: 5px; padding: 6px; font-size: 0.85em;">${items.join('\\n')}</textarea>`;
@@ -3596,7 +4286,7 @@ def index():
         }
 
         async function saveKnowledgeHistory(id) {
-            const keys = ['user_preferences', 'project_decisions', 'key_facts', 'pending_tasks', 'learned_patterns', 'important_context'];
+            const keys = ['user_preferences', 'architecture_decisions', 'design_principles', 'learned_patterns'];
             const content = {};
             for (const key of keys) {
                 const textarea = document.getElementById(`k-edit-${key}`);
@@ -3621,60 +4311,92 @@ def index():
             }
         }
 
+        async function regenerateKnowledgeHistory(id) {
+            showStatus('Regenerating knowledge #' + id + '...', 'action');
+            document.getElementById('knowledge-status').textContent = 'Regenerating...';
+            try {
+                const res = await fetch(`/api/projects/${currentProject}/knowledge/history/${id}/regenerate`, {method: 'POST'});
+                const data = await res.json();
+                if (data.error) {
+                    document.getElementById('knowledge-status').textContent = 'Error: ' + data.error;
+                    showStatus('Regenerate failed: ' + data.error, 'error');
+                } else {
+                    document.getElementById('knowledge-status').textContent = `Regenerated: ${data.total_items} items`;
+                    showStatus('Regenerated knowledge: ' + data.total_items + ' items', 'success');
+                    await loadKnowledgeHistory();
+                    viewKnowledgeHistory(id);
+                    setTimeout(() => document.getElementById('knowledge-status').textContent = '', 3000);
+                }
+            } catch (e) {
+                document.getElementById('knowledge-status').textContent = 'Error: ' + e.message;
+                showStatus('Regenerate error: ' + e.message, 'error');
+            }
+        }
+
         async function extractKnowledge() {
             if (!currentProject) {
-                alert('Please select a project first');
+                showStatus('Please select a project first', 'warning');
                 return;
             }
             const btn = event.target;
             btn.disabled = true;
             btn.textContent = 'Extracting...';
             document.getElementById('knowledge-status').textContent = 'Sending to LLM...';
+            showStatus('Extracting knowledge...', 'action');
             const res = await fetch(`/api/projects/${currentProject}/knowledge/extract`, {method: 'POST'});
             const data = await res.json();
             btn.disabled = false;
             btn.textContent = 'Extract New';
             document.getElementById('knowledge-status').textContent = '';
             if (data.error) {
-                alert('Error: ' + data.error);
+                showStatus('Extract error: ' + data.error, 'error');
                 return;
             }
             const newItems = Object.values(data.extracted || {}).flat().length;
             document.getElementById('knowledge-status').textContent = `Extracted ${newItems} new items`;
+            showStatus('Extracted ' + newItems + ' knowledge items', 'success');
             setTimeout(() => { document.getElementById('knowledge-status').textContent = ''; }, 3000);
             loadKnowledge();
         }
 
         async function loadKnowledgeDebug() {
             if (!currentProject) {
-                alert('Please select a project first');
+                showStatus('Please select a project first', 'warning');
                 return;
             }
             const res = await fetch(`/api/projects/${currentProject}/knowledge-debug`);
             const data = await res.json();
 
-            const cfg = data.content_config || {};
             const statusColor = data.pending_count > 0 ? '#ffcc00' : '#4caf50';
             document.getElementById('knowledge-debug-info').innerHTML = `
-                <div style="display: flex; flex-wrap: wrap; gap: 15px; align-items: center; margin-bottom: 8px;">
+                <div style="display: flex; flex-wrap: wrap; gap: 15px; align-items: center;">
                     <div><strong>Latest Msg:</strong> <span style="color: #00d9ff;">#${data.latest_message_id || 0}</span></div>
                     <div><strong>Last Extracted:</strong> <span style="color: #4caf50;">→ #${data.last_knowledge_end_id || 0}</span></div>
                     <div><strong>Pending:</strong> <span style="color: ${statusColor}; font-weight: bold;">${data.pending_count || 0} messages</span></div>
+                    <div><strong>Unextracted:</strong> ${data.message_count}</div>
+                    <div><strong>Custom Template:</strong> ${data.using_custom_template ? 'Yes' : 'No'}</div>
                 </div>
-                <div style="font-size: 0.85em; color: #888;">Content: thinking=${cfg.include_thinking ? 'on' : 'off'} (${cfg.max_chars_thinking}), tool=${cfg.include_tool ? 'on' : 'off'} (${cfg.max_chars_tool}), text=${cfg.include_text ? 'on' : 'off'} (${cfg.max_chars_text})</div>
             `;
-
+            document.getElementById('knowledge-debug-msg-count').textContent = data.message_count;
             document.getElementById('knowledge-debug-messages').innerHTML = data.messages.map(m => `
-                <div style="padding: 5px; margin: 3px 0; background: ${m.role === 'user' ? '#1a3a5c' : '#2d1f3d'}; border-radius: 4px; font-size: 0.85em;">
-                    <span style="color: ${m.role === 'user' ? '#00d9ff' : '#e94560'}; font-weight: bold;">${m.role}</span>
-                    <span style="color: #888; margin-left: 8px;">${escapeHtml(m.content.substring(0, 100))}...</span>
+                <div style="margin: 3px 0; padding: 6px; border-radius: 4px; background: ${m.role === 'user' ? '#1a3a4a' : '#2a1a4a'}; font-size: 0.85em;">
+                    <span style="color: ${m.role === 'user' ? '#00d9ff' : '#ff6b9d'}; font-weight: bold;">${m.role}</span>
+                    <span style="color: #888; margin-left: 5px;">#${m.id}</span>
+                    <span style="color: #666; margin-left: 5px; font-size: 0.8em;">[${m.session_id ? m.session_id.substring(0, 8) : 'unknown'}...]</span>
+                    <div style="color: #ccc; margin-top: 3px;">${escapeHtml(m.content.substring(0, 150))}${m.content.length > 150 ? '...' : ''}</div>
                 </div>
-            `).join('') || '<div style="color: #888;">No messages</div>';
+            `).join('') || '<p style="color: #888;">No unextracted messages (all caught up!)</p>';
+            document.getElementById('knowledge-debug-prompt').textContent = data.full_prompt || 'No prompt generated';
+        }
 
-            const noKnowledgeText = (window.i18n && window.i18n.ui_text && window.i18n.ui_text.no_existing_knowledge) || '(No existing knowledge)';
-            document.getElementById('knowledge-debug-existing').textContent = data.existing_knowledge || noKnowledgeText;
-            document.getElementById('knowledge-debug-prompt').textContent = data.full_prompt || 'No prompt';
-            document.getElementById('knowledge-debug-panel').style.display = 'block';
+        function toggleKnowledgeDebug() {
+            const panel = document.getElementById('knowledge-debug-panel');
+            if (panel.style.display === 'none') {
+                panel.style.display = 'block';
+                loadKnowledgeDebug();
+            } else {
+                panel.style.display = 'none';
+            }
         }
 
         // ========== Decisions Functions ==========
@@ -3702,17 +4424,6 @@ def index():
                 allDecisions = data.decisions || [];
                 defaultDecisionInjectCount = parseInt(configData.config?.inject_decision_count || configData.defaults?.inject_decision_count || 5);
                 decisionExtraSelection = selData.selected_ids || [];
-
-                // 显示消息级别的 pending 信息
-                const statusColor = data.pending_message_count > 0 ? '#ffcc00' : '#4caf50';
-                document.getElementById('decision-pending-info').innerHTML = `
-                    <div style="display: flex; flex-wrap: wrap; gap: 15px; align-items: center;">
-                        <div><strong>Latest Msg:</strong> <span style="color: #00d9ff;">#${data.latest_message_id || 0}</span></div>
-                        <div><strong>Last Extracted:</strong> <span style="color: #4caf50;">→ #${data.last_decision_end_id || 0}</span></div>
-                        <div><strong>Pending:</strong> <span style="color: ${statusColor}; font-weight: bold;">${data.pending_message_count || 0} messages</span></div>
-                        <div><strong>Pending Decisions:</strong> <span style="color: #e94560;">${data.pending_count || 0}</span></div>
-                    </div>
-                `;
 
                 // Update pending badge
                 const badge = document.getElementById('pending-decisions-badge');
@@ -3762,7 +4473,7 @@ def index():
             const autoIds = new Set(sortedConfirmed.slice(0, defaultDecisionInjectCount).map(d => d.id));
             const extraSet = new Set(decisionExtraSelection);
 
-            // 左栏：所有 confirmed，点击添加到 extra
+            // 左栏：所有 confirmed，带 checkbox 多选
             allEl.innerHTML = sortedConfirmed.map(d => {
                 const isAuto = autoIds.has(d.id);
                 const isExtra = extraSet.has(d.id);
@@ -3771,15 +4482,24 @@ def index():
                 const borderColor = isAuto ? '#00d9ff' : (isExtra ? '#e94560' : '#333');
                 const badge = isAuto ? '<span style="background:#00d9ff;color:#000;padding:1px 4px;border-radius:3px;font-size:0.7em;margin-left:5px;">AUTO</span>' : (isExtra ? '<span style="background:#e94560;color:#fff;padding:1px 4px;border-radius:3px;font-size:0.7em;margin-left:5px;">EXTRA</span>' : '');
                 const hasRange = d.message_range_start && d.message_range_end;
-                const msgBtn = hasRange ? `<button onclick="event.stopPropagation();showSummaryMessages(0, ${d.message_range_start}, ${d.message_range_end})" style="padding: 1px 4px; font-size: 0.7em; background: #1f4068;" title="View source messages">📜</button>` : '';
+                const msgBtn = hasRange
+                    ? `<button onclick="event.stopPropagation();showSummaryMessages(0, ${d.message_range_start}, ${d.message_range_end})" style="padding: 1px 4px; font-size: 0.7em; background: #1f4068;" title="View source messages #${d.message_range_start}-${d.message_range_end}">📜</button>`
+                    : `<button disabled style="padding: 1px 4px; font-size: 0.7em; background: #222; color: #555; cursor: not-allowed;" title="No message range (old decision)">📜</button>`;
+                const regenBtn = `<button onclick="event.stopPropagation();regenerateSingleDecision(${d.id})" style="padding: 1px 4px; font-size: 0.7em; background: #333;" title="Regenerate this decision">🔄</button>`;
+                const editBtn = `<button onclick="event.stopPropagation();editDecision(${d.id})" style="padding: 1px 4px; font-size: 0.7em; background: #1f4068;" title="Edit (move back to pending)">✏️</button>`;
+                const batchBtn = hasRange
+                    ? `<button onclick="event.stopPropagation();regenerateBatchDecisions(${d.id}, true)" style="padding: 1px 4px; font-size: 0.7em; background: #442;" title="Regenerate all decisions from this batch">📦</button>`
+                    : `<button disabled style="padding: 1px 4px; font-size: 0.7em; background: #222; color: #555; cursor: not-allowed;" title="No message range (old decision)">📦</button>`;
+                const checkboxTitle = isAuto ? 'Auto-selected (latest N)' : (isExtra ? 'Extra selected' : 'Click to select');
+                const checkbox = `<input type="checkbox" ${isSelected ? 'checked' : ''} ${isAuto ? 'disabled' : ''} onclick="event.stopPropagation();toggleDecisionExtra(${d.id})" style="cursor: ${isAuto ? 'not-allowed' : 'pointer'}; margin-right: 6px;" title="${checkboxTitle}">`;
                 return `
-                <div class="card" style="margin-bottom: 8px; padding: 8px; background: ${bgColor}; border-left: 3px solid ${borderColor}; cursor: pointer;" onclick="addDecisionExtra(${d.id})">
+                <div class="card" style="margin-bottom: 8px; padding: 8px; background: ${bgColor}; border-left: 3px solid ${borderColor};">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <span style="font-size: 0.8em; color: #888;">#${d.id} ${formatDateTime(d.timestamp)}${badge}</span>
-                        ${msgBtn}
+                        <span style="font-size: 0.8em; color: #888;">${checkbox}#${d.id} ${formatDateTime(d.timestamp)}${badge}</span>
+                        <div style="display: flex; gap: 3px;">${msgBtn}${editBtn}${regenBtn}${batchBtn}</div>
                     </div>
-                    <div style="margin-top: 5px; font-size: 0.85em;"><strong style="color: #00d9ff;">${escapeHtml(d.problem.substring(0, 60))}${d.problem.length > 60 ? '...' : ''}</strong></div>
-                    <div style="margin-top: 3px; font-size: 0.8em; color: #4ad9a0;">→ ${escapeHtml(d.solution.substring(0, 60))}${d.solution.length > 60 ? '...' : ''}</div>
+                    <div style="margin-top: 5px; font-size: 0.85em; margin-left: 20px;"><strong style="color: #00d9ff;">${escapeHtml(d.problem.substring(0, 60))}${d.problem.length > 60 ? '...' : ''}</strong></div>
+                    <div style="margin-top: 3px; font-size: 0.8em; color: #4ad9a0; margin-left: 20px;">→ ${escapeHtml(d.solution.substring(0, 60))}${d.solution.length > 60 ? '...' : ''}</div>
                 </div>`;
             }).join('');
 
@@ -3809,17 +4529,21 @@ def index():
                 : '<p style="color: #666; font-size: 0.85em;">No decisions</p>';
         }
 
-        function addDecisionExtra(id) {
+        function toggleDecisionExtra(id) {
             const confirmed = allDecisions.filter(d => d.status === 'confirmed');
             const sortedConfirmed = [...confirmed].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
             const autoIds = new Set(sortedConfirmed.slice(0, defaultDecisionInjectCount).map(d => d.id));
-            // 不能添加 auto 的，也不能重复添加
-            if (!autoIds.has(id) && !decisionExtraSelection.includes(id)) {
+            // Auto 的不能操作
+            if (autoIds.has(id)) return;
+            // 切换选中状态
+            if (decisionExtraSelection.includes(id)) {
+                decisionExtraSelection = decisionExtraSelection.filter(x => x !== id);
+            } else {
                 decisionExtraSelection.push(id);
-                decisionSelectionDirty = true;
-                updateDecisionDirtyHint();
-                renderDecisions();
             }
+            decisionSelectionDirty = true;
+            updateDecisionDirtyHint();
+            renderDecisions();
         }
 
         function removeDecisionExtra(id) {
@@ -3847,13 +4571,14 @@ def index():
 
         async function extractDecisions() {
             if (!currentProject) {
-                alert('Please select a project first');
+                showStatus('Please select a project first', 'warning');
                 return;
             }
             const btn = event.target;
             btn.disabled = true;
             btn.textContent = 'Extracting...';
             document.getElementById('decisions-status').textContent = 'Sending to LLM...';
+            showStatus('Extracting decisions...', 'action');
 
             try {
                 const res = await fetch(`/api/projects/${currentProject}/decisions/extract`, {method: 'POST'});
@@ -3864,49 +4589,106 @@ def index():
 
                 if (data.error) {
                     document.getElementById('decisions-status').textContent = 'Error: ' + data.error;
+                    showStatus('Extract error: ' + data.error, 'error');
                 } else {
                     document.getElementById('decisions-status').textContent = data.message;
+                    showStatus(data.message, 'success');
                     loadDecisions();
                 }
             } catch (e) {
                 btn.disabled = false;
                 btn.textContent = 'Extract Now';
                 document.getElementById('decisions-status').textContent = 'Error: ' + e.message;
+                showStatus('Extract error: ' + e.message, 'error');
             }
         }
 
         async function loadDecisionDebug() {
             if (!currentProject) {
-                alert('Please select a project first');
+                showStatus('Please select a project first', 'warning');
                 return;
             }
-            document.getElementById('decisions-status').textContent = 'Loading prompt...';
 
             try {
                 const res = await fetch(`/api/projects/${currentProject}/decisions/debug`);
                 const data = await res.json();
-                document.getElementById('decisions-status').textContent = '';
 
-                const panel = document.getElementById('decision-debug-panel');
-                const content = document.getElementById('decision-debug-content');
                 const statusColor = data.pending_count > 0 ? '#ffcc00' : '#4caf50';
-                content.textContent = `=== Latest Msg: #${data.latest_message_id || 0} | Last Extracted: → #${data.last_decision_end_id || 0} | Pending: ${data.pending_count || 0} messages ===\n=== Messages: ${data.message_count}, Conversation: ${data.conversation_length} chars ===\n\n${data.prompt}`;
-                panel.style.display = 'block';
+                document.getElementById('decision-debug-info').innerHTML = `
+                    <div style="display: flex; flex-wrap: wrap; gap: 15px; align-items: center;">
+                        <div><strong>Latest Msg:</strong> <span style="color: #00d9ff;">#${data.latest_message_id || 0}</span></div>
+                        <div><strong>Last Extracted:</strong> <span style="color: #4caf50;">→ #${data.last_decision_end_id || 0}</span></div>
+                        <div><strong>Pending:</strong> <span style="color: ${statusColor}; font-weight: bold;">${data.pending_count || 0} messages</span></div>
+                        <div><strong>Unextracted:</strong> ${data.message_count}</div>
+                        <div><strong>Custom Template:</strong> ${data.using_custom_template ? 'Yes' : 'No'}</div>
+                    </div>
+                `;
+                document.getElementById('decision-debug-msg-count').textContent = data.message_count;
+                document.getElementById('decision-debug-messages').innerHTML = (data.messages || []).map(m => `
+                    <div style="margin: 3px 0; padding: 6px; border-radius: 4px; background: ${m.role === 'user' ? '#1a3a4a' : '#2a1a4a'}; font-size: 0.85em;">
+                        <span style="color: ${m.role === 'user' ? '#00d9ff' : '#ff6b9d'}; font-weight: bold;">${m.role}</span>
+                        <span style="color: #888; margin-left: 5px;">#${m.id}</span>
+                        <span style="color: #666; margin-left: 5px; font-size: 0.8em;">[${m.session_id ? m.session_id.substring(0, 8) : 'unknown'}...]</span>
+                        <div style="color: #ccc; margin-top: 3px;">${escapeHtml(m.content.substring(0, 150))}${m.content.length > 150 ? '...' : ''}</div>
+                    </div>
+                `).join('') || '<p style="color: #888;">No unextracted messages (all caught up!)</p>';
+                document.getElementById('decision-debug-prompt').textContent = data.full_prompt || 'No prompt generated';
             } catch (e) {
                 document.getElementById('decisions-status').textContent = 'Error: ' + e.message;
             }
         }
 
+        function toggleDecisionDebug() {
+            const panel = document.getElementById('decision-debug-panel');
+            if (panel.style.display === 'none') {
+                panel.style.display = 'block';
+                loadDecisionDebug();
+            } else {
+                panel.style.display = 'none';
+            }
+        }
+
         function renderPendingDecision(d) {
+            const isEmpty = d.status === 'empty';
             let options = [];
             let files = [];
             try { options = typeof d.reason_options === 'string' ? JSON.parse(d.reason_options || '[]') : (d.reason_options || []); } catch (e) {}
             try { files = typeof d.files === 'string' ? JSON.parse(d.files || '[]') : (d.files || []); } catch (e) {}
+            const hasRange = d.message_range_start && d.message_range_end;
+            const msgBtn = hasRange
+                ? `<button onclick="event.stopPropagation();showSummaryMessages(0, ${d.message_range_start}, ${d.message_range_end})" style="padding: 1px 4px; font-size: 0.7em; background: #1f4068;" title="View source messages #${d.message_range_start}-${d.message_range_end}">📜</button>`
+                : `<button disabled style="padding: 1px 4px; font-size: 0.7em; background: #222; color: #555; cursor: not-allowed;" title="No message range">📜</button>`;
+            const batchBtn = hasRange
+                ? `<button onclick="event.stopPropagation();regenerateBatchDecisions(${d.id}, true)" style="padding: 4px 10px; background: #442; font-size: 0.85em;" title="Regenerate all from this batch">📦</button>`
+                : '';
+
+            // Empty placeholder - 只显示批量重新生成按钮
+            if (isEmpty) {
+                return `
+                    <div class="card" style="margin-bottom: 15px; border-left: 3px solid #666; background: #1a1a2e;">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <div>
+                                <span style="color: #888; font-size: 0.85em;">#${d.id} · ${new Date(d.timestamp).toLocaleString()} ${msgBtn}</span>
+                                <div style="color: #666; margin-top: 5px; font-style: italic;">
+                                    No decisions extracted from messages #${d.message_range_start}-#${d.message_range_end} (${d.message_count} msgs)
+                                </div>
+                            </div>
+                            <div style="display: flex; gap: 5px;">
+                                ${batchBtn}
+                                <button onclick="deleteDecision(${d.id})" style="padding: 4px 10px; background: #333; font-size: 0.85em;">Delete</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
             return `
                 <div class="card" style="margin-bottom: 15px; border-left: 3px solid #e94560;">
                     <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px;">
-                        <span style="color: #888; font-size: 0.85em;">#${d.id} · ${new Date(d.timestamp).toLocaleString()}</span>
+                        <span style="color: #888; font-size: 0.85em;">#${d.id} · ${new Date(d.timestamp).toLocaleString()} ${msgBtn}</span>
                         <div style="display: flex; gap: 5px;">
+                            <button onclick="regenerateSingleDecision(${d.id})" style="padding: 4px 10px; background: #1f4068; font-size: 0.85em;" title="Regenerate this decision">🔄</button>
+                            ${batchBtn}
                             <button onclick="skipDecision(${d.id})" style="padding: 4px 10px; background: #333; font-size: 0.85em;">Skip</button>
                             <button onclick="deleteDecision(${d.id})" style="padding: 4px 10px; background: #e94560; font-size: 0.85em;">Delete</button>
                         </div>
@@ -3921,16 +4703,16 @@ def index():
                     </div>
                     ${files.length > 0 ? `<div style="margin-bottom: 8px; color: #888; font-size: 0.85em;">Files: ${files.map(f => `<code>${escapeHtml(f)}</code>`).join(', ')}</div>` : ''}
                     <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #333;">
-                        <strong style="color: #d9a04a;">Select Reason:</strong>
+                        <strong style="color: #d9a04a;">Select Reason(s):</strong>
                         <div id="reason-options-${d.id}" style="margin-top: 8px;">
                             ${options.map((opt, i) => `
                                 <label style="display: block; margin-bottom: 6px; cursor: pointer;">
-                                    <input type="radio" name="reason-${d.id}" value="${escapeHtml(opt)}" style="margin-right: 8px;">
+                                    <input type="checkbox" class="reason-checkbox-${d.id}" value="${escapeHtml(opt)}" style="margin-right: 8px;">
                                     ${escapeHtml(opt)}
                                 </label>
                             `).join('')}
                             <label style="display: block; margin-bottom: 6px; cursor: pointer;">
-                                <input type="radio" name="reason-${d.id}" value="__other__" style="margin-right: 8px;">
+                                <input type="checkbox" class="reason-checkbox-${d.id}" value="__other__" style="margin-right: 8px;">
                                 Other: <input type="text" id="reason-other-${d.id}" placeholder="Enter custom reason..." style="padding: 4px 8px; width: 300px;">
                             </label>
                         </div>
@@ -3945,21 +4727,28 @@ def index():
         }
 
         async function confirmDecision(id) {
-            const selectedRadio = document.querySelector(`input[name="reason-${id}"]:checked`);
-            if (!selectedRadio) {
-                alert('Please select a reason');
+            const selectedCheckboxes = document.querySelectorAll(`.reason-checkbox-${id}:checked`);
+            if (selectedCheckboxes.length === 0) {
+                showStatus('Please select at least one reason', 'warning');
                 return;
             }
 
-            let reason = selectedRadio.value;
-            if (reason === '__other__') {
-                reason = document.getElementById(`reason-other-${id}`).value.trim();
-                if (!reason) {
-                    alert('Please enter a custom reason');
-                    return;
+            const reasons = [];
+            selectedCheckboxes.forEach(cb => {
+                if (cb.value === '__other__') {
+                    const customReason = document.getElementById(`reason-other-${id}`).value.trim();
+                    if (customReason) reasons.push(customReason);
+                } else {
+                    reasons.push(cb.value);
                 }
+            });
+
+            if (reasons.length === 0) {
+                showStatus('Please enter a custom reason', 'warning');
+                return;
             }
 
+            const reason = reasons.join('; ');
             const note = document.getElementById(`note-${id}`).value.trim();
 
             try {
@@ -3969,12 +4758,13 @@ def index():
                     body: JSON.stringify({status: 'confirmed', reason, note})
                 });
                 if (res.ok) {
+                    showStatus('Decision #' + id + ' confirmed', 'success');
                     loadDecisions();
                 } else {
-                    alert('Failed to confirm decision');
+                    showStatus('Failed to confirm decision', 'error');
                 }
             } catch (e) {
-                alert('Error: ' + e.message);
+                showStatus('Error: ' + e.message, 'error');
             }
         }
 
@@ -3986,6 +4776,7 @@ def index():
                     body: JSON.stringify({status: 'skipped'})
                 });
                 if (res.ok) {
+                    showStatus('Decision #' + id + ' skipped', 'info');
                     loadDecisions();
                 }
             } catch (e) {
@@ -3994,15 +4785,77 @@ def index():
         }
 
         async function deleteDecision(id) {
-            if (!confirm('Delete this decision?')) return;
+            showStatus('Deleting decision #' + id + '...', 'action');
             try {
                 const res = await fetch(`/api/projects/${currentProject}/decisions/${id}`, {method: 'DELETE'});
                 if (res.ok) {
+                    showStatus('Decision #' + id + ' deleted', 'success');
                     loadDecisions();
                 }
             } catch (e) {
                 console.error('Error deleting decision:', e);
+                showStatus('Delete error: ' + e.message, 'error');
             }
+        }
+
+        async function editDecision(id) {
+            try {
+                const res = await fetch(`/api/projects/${currentProject}/decisions/${id}`, {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({status: 'pending'})
+                });
+                if (res.ok) {
+                    showStatus('Decision #' + id + ' moved to pending', 'success');
+                    loadDecisions();
+                }
+            } catch (e) {
+                console.error('Error editing decision:', e);
+            }
+        }
+
+        async function regenerateSingleDecision(id) {
+            showStatus('Regenerating decision #' + id + '...', 'action');
+            document.getElementById('decisions-status').textContent = 'Regenerating...';
+            try {
+                const res = await fetch(`/api/projects/${currentProject}/decisions/${id}/regenerate`, {method: 'POST'});
+                const data = await res.json();
+                if (data.error) {
+                    document.getElementById('decisions-status').textContent = 'Error: ' + data.error;
+                    showStatus('Regenerate error: ' + data.error, 'error');
+                } else {
+                    document.getElementById('decisions-status').textContent = data.message;
+                    showStatus(data.message, 'success');
+                    loadDecisions();
+                }
+            } catch (e) {
+                document.getElementById('decisions-status').textContent = 'Error: ' + e.message;
+                showStatus('Regenerate error: ' + e.message, 'error');
+            }
+            setTimeout(() => { document.getElementById('decisions-status').textContent = ''; }, 3000);
+        }
+
+        async function regenerateBatchDecisions(id, deleteOld = false) {
+            const actionDesc = deleteOld ? 'Regenerating batch (deleting old)...' : 'Regenerating batch...';
+            showStatus(actionDesc, 'action');
+            document.getElementById('decisions-status').textContent = 'Regenerating batch...';
+            try {
+                const res = await fetch(`/api/projects/${currentProject}/decisions/regenerate-batch`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({decision_id: id, delete_old: deleteOld})
+                });
+                const data = await res.json();
+                if (data.error) {
+                    document.getElementById('decisions-status').textContent = 'Error: ' + data.error;
+                } else {
+                    document.getElementById('decisions-status').textContent = data.message;
+                    loadDecisions();
+                }
+            } catch (e) {
+                document.getElementById('decisions-status').textContent = 'Error: ' + e.message;
+            }
+            setTimeout(() => { document.getElementById('decisions-status').textContent = ''; }, 3000);
         }
 
         // 加载应用配置
@@ -4012,7 +4865,6 @@ def index():
                 const data = await res.json();
                 const cfg = data.config || {};
                 const defaults = data.defaults || {};
-                appConfig.summary_max_chars_total = parseInt(cfg.summary_max_chars_total || defaults.summary_max_chars_total || 8000);
                 appConfig.search_result_preview_length = parseInt(cfg.search_result_preview_length || defaults.search_result_preview_length || 500);
                 appConfig.dashboard_refresh_interval = parseInt(cfg.dashboard_refresh_interval || defaults.dashboard_refresh_interval || 5000);
                 console.log('App config loaded:', appConfig);

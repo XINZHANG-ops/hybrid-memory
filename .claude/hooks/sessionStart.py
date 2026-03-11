@@ -128,7 +128,6 @@ def main():
         inject_summary_count = config_mgr.get_int("inject_summary_count")
         inject_recent_count = config_mgr.get_int("inject_recent_count")
         inject_knowledge_count = config_mgr.get_int("inject_knowledge_count")
-        inject_task_count = config_mgr.get_int("inject_task_count")
         logger.info(f"Inject config: summaries={inject_summary_count}, recent={inject_recent_count}")
 
         # 1. 加载项目级记忆
@@ -188,29 +187,32 @@ def main():
                 recent = "\n".join(formatted_messages)
                 output_parts.append(f"# [{project_name}] 最近对话:\n{recent}")
 
-        # 2. 加载结构化知识
+        # 2. 加载结构化知识（项目级长期记忆）
         knowledge = project_manager.get_knowledge(None)
         knowledge_items = []
         if knowledge.get("user_preferences"):
             knowledge_items.append(f"用户偏好: {', '.join(knowledge['user_preferences'][:inject_knowledge_count])}")
+        if knowledge.get("architecture_decisions"):
+            knowledge_items.append(f"架构决策: {', '.join(knowledge['architecture_decisions'][:inject_knowledge_count])}")
+        if knowledge.get("design_principles"):
+            knowledge_items.append(f"设计原则: {', '.join(knowledge['design_principles'][:inject_knowledge_count])}")
+        if knowledge.get("learned_patterns"):
+            knowledge_items.append(f"行为模式: {', '.join(knowledge['learned_patterns'][:inject_knowledge_count])}")
+        # 兼容旧数据
         if knowledge.get("project_decisions"):
             knowledge_items.append(f"项目决策: {', '.join(knowledge['project_decisions'][:inject_knowledge_count])}")
         if knowledge.get("key_facts"):
             knowledge_items.append(f"关键事实: {', '.join(knowledge['key_facts'][:inject_knowledge_count])}")
-        if knowledge.get("pending_tasks"):
-            knowledge_items.append(f"待办事项: {', '.join(knowledge['pending_tasks'][:inject_task_count])}")
-        if knowledge.get("learned_patterns"):
-            knowledge_items.append(f"行为模式: {', '.join(knowledge['learned_patterns'][:inject_knowledge_count])}")
-        if knowledge.get("important_context"):
-            knowledge_items.append(f"重要上下文: {', '.join(knowledge['important_context'][:inject_knowledge_count])}")
 
         if knowledge_items:
             output_parts.append(f"# [{project_name}] 累积知识:\n" + "\n".join(f"- {item}" for item in knowledge_items))
             logger.info(f"Found knowledge: {len(knowledge_items)} categories")
 
-        # 2.5 加载已确认的决策
+        # 2.5 加载已确认的决策：按 timestamp DESC 取最新 N 个（与 Dashboard JS 一致）
         inject_decision_count = config_mgr.get_int("inject_decision_count")
-        auto_decisions = project_manager.db.get_decisions(project=project_name, status="confirmed", limit=inject_decision_count)
+        all_confirmed = project_manager.db.get_decisions(project=project_name, status="confirmed", limit=1000)
+        sorted_confirmed = sorted(all_confirmed, key=lambda d: d.timestamp, reverse=True)
+        auto_decisions = sorted_confirmed[:inject_decision_count]
         auto_decision_ids = {d.id for d in auto_decisions}
 
         selected_decision_config = config_mgr.get("selected_decision_ids")
@@ -234,6 +236,9 @@ def main():
                 line = f"- **{d.problem}** → {d.solution}"
                 if d.reason:
                     line += f" (因为: {d.reason})"
+                files = json.loads(d.files) if isinstance(d.files, str) else (d.files or [])
+                if files:
+                    line += f" [文件: {', '.join(files)}]"
                 decision_lines.append(line)
             output_parts.append(f"# [{project_name}] 相关决策:\n" + "\n".join(decision_lines))
             logger.info(f"Injecting {len(all_decisions)} confirmed decisions (auto={len(auto_decisions)}, extra={len(extra_decisions)})")

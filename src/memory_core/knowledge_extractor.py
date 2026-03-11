@@ -101,9 +101,10 @@ class KnowledgeExtractor:
 
             knowledge = json.loads(response)
 
-            # 验证结构
-            valid_keys = ["user_preferences", "project_decisions", "key_facts",
-                         "pending_tasks", "learned_patterns", "important_context"]
+            # 验证结构（新类别 + 兼容旧数据）
+            valid_keys = ["user_preferences", "architecture_decisions", "design_principles",
+                         "learned_patterns", "project_decisions", "key_facts",
+                         "pending_tasks", "important_context"]
             result = {k: knowledge.get(k, []) for k in valid_keys}
 
             # 确保每个值都是列表
@@ -119,11 +120,9 @@ class KnowledgeExtractor:
     def _empty_knowledge(self) -> dict:
         return {
             "user_preferences": [],
-            "project_decisions": [],
-            "key_facts": [],
-            "pending_tasks": [],
+            "architecture_decisions": [],
+            "design_principles": [],
             "learned_patterns": [],
-            "important_context": []
         }
 
     def merge_knowledge(self, existing: dict, new: dict) -> dict:

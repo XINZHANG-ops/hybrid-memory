@@ -58,7 +58,7 @@ def extract_decisions(project_name: str, session_id: str, project_db: Path, conf
 
     decision_prompt = config_mgr.get("decision_extraction_prompt") or ""
     extractor = DecisionExtractor(llm_client, content_config, decision_prompt)
-    decisions = extractor.extract_decisions(msg_list, project_name, session_id, message_ids=message_ids)
+    decisions = extractor.extract_decisions(msg_list, project_name, session_id, max_messages=None, message_ids=message_ids)
 
     if message_ids:
         db.mark_messages_decision_extracted(message_ids)
@@ -69,7 +69,22 @@ def extract_decisions(project_name: str, session_id: str, project_db: Path, conf
         logger.info(f"[Background] Saved {len(decisions)} decisions")
         publish_event("decision_done", f"Extracted {len(decisions)} decisions", project_name)
     else:
-        logger.info("[Background] No decisions detected in conversation")
+        # 即使没有生成 decision，也创建一个占位记录，方便用户重新生成
+        from src.memory_core.database import Decision
+        placeholder = Decision(
+            problem="(No decisions extracted from this batch)",
+            solution="",
+            status="empty",
+            reason_options=[],
+            files=[],
+            session_id=session_id,
+            message_range_start=min(message_ids) if message_ids else None,
+            message_range_end=max(message_ids) if message_ids else None,
+            message_count=len(message_ids),
+        )
+        db.add_decision(placeholder)
+        logger.info(f"[Background] No decisions found, saved placeholder for messages #{min(message_ids)}-#{max(message_ids)}")
+        publish_event("decision_done", f"No decisions (placeholder #{min(message_ids)}-#{max(message_ids)})", project_name)
 
 
 def main():

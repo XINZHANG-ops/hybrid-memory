@@ -205,3 +205,112 @@ def config_from_dict(config_dict: dict[str, str]) -> ContentConfig:
         max_chars_tool=int(config_dict.get("content_max_chars_tool", "300")),
         max_chars_text=int(config_dict.get("content_max_chars_text", "500")),
     )
+
+
+@dataclass
+class TouchedFile:
+    """文件操作记录"""
+    path: str
+    action: str  # "read", "edit", "write"
+
+
+def extract_touched_files(messages: list[Any]) -> list[TouchedFile]:
+    """
+    从消息列表中提取所有涉及的文件操作
+
+    解析 tool 块，提取 Read/Edit/Write 工具的 file_path
+    消息内容格式: [{"type": "tool", "name": "Edit", "content": "path\\nold: ...\\nnew: ..."}, ...]
+
+    Args:
+        messages: 消息对象列表（需要有 content 属性）
+
+    Returns:
+        去重后的文件操作列表
+    """
+    seen = set()
+    files = []
+
+    for msg in messages:
+        content = getattr(msg, "content", "") if hasattr(msg, "content") else msg.get("content", "")
+        if not content:
+            continue
+
+        blocks = parse_content_blocks(content)
+        for block in blocks:
+            if block.type != "tool":
+                continue
+
+            tool_name = block.tool_name.lower()
+            tool_content = block.content
+
+            # 根据工具类型提取文件路径
+            if tool_name in ("edit", "write", "read"):
+                # 格式: "file_path\n..." (第一行是路径)
+                lines = tool_content.split("\n", 1)
+                file_path = lines[0].strip() if lines else ""
+                if file_path and file_path not in seen:
+                    action = "read" if tool_name == "read" else tool_name
+                    seen.add(file_path)
+                    files.append(TouchedFile(path=file_path, action=action))
+
+    return files
+
+
+def _to_relative_paths(paths: list[str]) -> list[str]:
+    """将绝对路径列表转换为相对路径（移除公共前缀）"""
+    import os
+
+    if not paths:
+        return []
+    if len(paths) == 1:
+        # 单个文件，取最后两级目录 + 文件名
+        parts = paths[0].replace("\\", "/").split("/")
+        return ["/".join(parts[-3:]) if len(parts) > 3 else paths[0]]
+
+    # 多个文件，找公共前缀（统一使用正斜杠）
+    normalized = [p.replace("\\", "/") for p in paths]
+    prefix = os.path.commonpath(normalized).replace("\\", "/")
+
+    # 移除前缀，保留相对路径
+    result = []
+    for p in normalized:
+        rel = p[len(prefix):].lstrip("/") if p.startswith(prefix) else p
+        result.append(rel if rel else os.path.basename(p))
+    return result
+
+
+def format_touched_files(files: list[TouchedFile], max_files: int = 20) -> str:
+    """
+    格式化文件列表为 prompt 可用的字符串（使用相对路径）
+
+    Args:
+        files: 文件操作列表
+        max_files: 最大显示数量
+
+    Returns:
+        格式化的文件列表字符串
+    """
+    if not files:
+        return "(无文件操作记录)"
+
+    # 收集所有路径并转换为相对路径
+    all_paths = [f.path for f in files]
+    rel_paths = _to_relative_paths(all_paths)
+    path_map = dict(zip(all_paths, rel_paths))
+
+    # 按 action 分组显示
+    edits = [path_map[f.path] for f in files if f.action == "edit"]
+    writes = [path_map[f.path] for f in files if f.action == "write"]
+    reads = [path_map[f.path] for f in files if f.action == "read"]
+
+    lines = []
+    if edits:
+        lines.append(f"编辑: {', '.join(edits[:max_files])}")
+    if writes:
+        lines.append(f"创建: {', '.join(writes[:max_files])}")
+    if reads:
+        remaining = max_files - len(edits) - len(writes)
+        if remaining > 0:
+            lines.append(f"读取: {', '.join(reads[:remaining])}")
+
+    return "\n".join(lines) if lines else "(无文件操作记录)"

@@ -51,7 +51,14 @@
       "Bash(ls:*)",
       "Bash(.venvScriptspython -m py_compile src/memory_core/hook_utils.py .claude/hooks/userPromptSubmit.py .claude/hooks/stop.py .claude/hooks/sessionStart.py .claude/hooks/permissionRequest.py .claude/hooks/postToolUse.py .claude/hooks/background_summary.py src/memory_core/retriever.py src/http_api/dashboard.py)",
       "Bash(D:pythonhybrid-memory.venvScriptspython.exe -m py_compile D:pythonhybrid-memorysrcmemory_corehook_utils.py D:pythonhybrid-memory.claudehooksuserPromptSubmit.py D:pythonhybrid-memory.claudehooksstop.py D:pythonhybrid-memory.claudehookssessionStart.py D:pythonhybrid-memory.claudehookspermissionRequest.py D:pythonhybrid-memory.claudehookspostToolUse.py D:pythonhybrid-memory.claudehooksbackground_summary.py D:pythonhybrid-memorysrcmemory_coreretriever.py D:pythonhybrid-memorysrchttp_apidashboard.py)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(.venv\\\\Scripts\\\\python:*)",
+      "Bash(.venv/Scripts/python -c \"import sqlite3; from pathlib import Path; import json; projects_dir = Path\\(''data/projects''\\); [print\\(f''=== {db_path.name} ===''\\) or [print\\(f''ID: {row[0]}, Status: {row[5]}''\\) or print\\(f''  Problem: {row[3][:80]}...''\\) or print\\(f''  Solution: {row[4][:80]}...''\\) or print\\(f''  Files: {row[9]}''\\) or print\\(f''  MsgRange: {row[11]}-{row[12]} \\({row[13]} msgs\\)''\\) or print\\(\\) for row in sqlite3.connect\\(db_path\\).execute\\(''SELECT * FROM decisions ORDER BY id DESC LIMIT 5''\\).fetchall\\(\\)] or print\\(''  No decisions\\\\n''\\) for db_path in projects_dir.glob\\(''*.db''\\)]\")",
+      "Bash(cmd /c \"chcp 65001 >nul && .venv\\\\Scripts\\\\python -c \"\"import sqlite3; db = sqlite3.connect\\(''data/projects/hybrid-memory.db''\\); rows = db.execute\\(''SELECT id, status, problem, solution, files, message_range_start, message_range_end, message_count FROM decisions ORDER BY id DESC LIMIT 8''\\).fetchall\\(\\); [print\\(f''ID={r[0]} Status={r[1]}''\\) or print\\(f''  Problem: {r[2][:100]}''\\) or print\\(f''  Solution: {r[3][:100]}''\\) or print\\(f''  Files: {r[4]}''\\) or print\\(f''  Range: {r[5]}-{r[6]} \\({r[7]} msgs\\)''\\) or print\\(\\) for r in rows]\"\"\")",
+      "Bash(cmd /c \".venv\\\\Scripts\\\\python -c \"\"import sqlite3; db = sqlite3.connect\\(''data/projects/hybrid-memory.db''\\); print\\(db.execute\\(''SELECT id, status, files FROM decisions''\\).fetchall\\(\\)\\)\"\"\")",
+      "Bash(cmd /c \".venv\\\\Scripts\\\\python -m py_compile src/memory_core/content_processor.py src/memory_core/decision_extractor.py src/memory_core/prompts.py src/http_api/dashboard.py && echo All OK\")",
+      "Bash(.venv/Scripts/python:*)",
+      "Bash(.venv\\\\Scripts\\\\python.exe:*)"
     ]
   }
 }

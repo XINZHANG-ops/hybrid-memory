@@ -49,7 +49,7 @@ def estimate_tokens(text: str) -> int:
 
 
 def get_processed_message_ids(db_path: Path) -> set:
-    """从数据库获取已处理过的 message_id 集合"""
+    """从数据库获取已处理过的 message_id 集合（用于 token 计算去重）"""
     try:
         import sqlite3
         if not db_path.exists():

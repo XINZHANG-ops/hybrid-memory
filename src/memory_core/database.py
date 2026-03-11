@@ -156,13 +156,7 @@ class Database:
             except sqlite3.OperationalError:
                 logger.info("Migrating: adding is_decision_extracted column to messages table")
                 conn.execute("ALTER TABLE messages ADD COLUMN is_decision_extracted BOOLEAN DEFAULT 0")
-                # 同步已总结消息的状态
-                conn.execute("UPDATE messages SET is_decision_extracted = 1 WHERE is_summarized = 1")
-                logger.info("Migrating: synced is_decision_extracted from is_summarized")
-            # Migration: sync existing summarized messages (for databases that already have the columns)
-            synced = self._sync_extraction_flags(conn)
-            if synced:
-                logger.info(f"Migrating: synced {synced} messages' extraction flags from is_summarized")
+                logger.info("Migrating: added is_decision_extracted column")
             # Migration: add message_range columns to knowledge_history if not exists
             try:
                 conn.execute("SELECT message_range_start FROM knowledge_history LIMIT 1")
@@ -180,17 +174,6 @@ class Database:
                 conn.execute("ALTER TABLE decisions ADD COLUMN message_range_end INTEGER")
                 conn.execute("ALTER TABLE decisions ADD COLUMN message_count INTEGER DEFAULT 0")
         logger.debug("Schema initialization complete")
-
-    def _sync_extraction_flags(self, conn) -> int:
-        """同步 is_summarized=1 但 is_knowledge_extracted=0 或 is_decision_extracted=0 的消息"""
-        cursor = conn.execute(
-            """UPDATE messages SET
-               is_knowledge_extracted = 1,
-               is_decision_extracted = 1
-               WHERE is_summarized = 1
-               AND (is_knowledge_extracted = 0 OR is_decision_extracted = 0)"""
-        )
-        return cursor.rowcount
 
     @contextmanager
     def _connect(self):
@@ -689,8 +672,10 @@ class Database:
 
     def get_knowledge(self, session_id: str | None = None) -> dict:
         logger.debug(f"Getting knowledge for session: {session_id}")
-        categories = ["user_preferences", "project_decisions", "key_facts",
-                     "pending_tasks", "learned_patterns", "important_context"]
+        # 新类别 + 兼容旧数据的类别
+        categories = ["user_preferences", "architecture_decisions", "design_principles",
+                     "learned_patterns", "project_decisions", "key_facts",
+                     "pending_tasks", "important_context"]
         result = {c: [] for c in categories}
 
         with self._connect() as conn:
@@ -855,7 +840,7 @@ class Database:
                     decision.message_range_start,
                     decision.message_range_end,
                     decision.message_count,
-                    decision.timestamp,
+                    decision.timestamp.strftime("%Y-%m-%d %H:%M:%S.%f") if decision.timestamp else None,
                 ),
             )
             decision.id = cursor.lastrowid
@@ -922,6 +907,24 @@ class Database:
             if deleted:
                 logger.info(f"Decision deleted: id={decision_id}")
             return deleted
+
+    def get_decision(self, decision_id: int) -> Decision | None:
+        """获取单个决策（get_decision_by_id 的别名）"""
+        return self.get_decision_by_id(decision_id)
+
+    def get_decisions_by_message_range(self, start: int, end: int) -> list[Decision]:
+        """获取指定消息范围内的所有决策"""
+        logger.debug(f"Getting decisions by message range: {start}-{end}")
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM decisions
+                   WHERE message_range_start = ? AND message_range_end = ?
+                   ORDER BY timestamp ASC""",
+                (start, end),
+            ).fetchall()
+            decisions = [self._row_to_decision(row) for row in rows]
+            logger.debug(f"Retrieved {len(decisions)} decisions for range {start}-{end}")
+            return decisions
 
     def count_pending_decisions(self, project: str | None = None) -> int:
         logger.debug(f"Counting pending decisions: project={project}")

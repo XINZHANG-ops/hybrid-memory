@@ -4,28 +4,23 @@ from .llm_client import LLMClient
 from .prompts import SUMMARY_PROMPT, SUMMARY_PROMPT_WITH_CONTEXT, ROLE_LABELS
 from .content_processor import ContentConfig, process_content
 
-# 默认值（可通过配置覆盖）
-DEFAULT_MAX_CHARS_TOTAL = 8000
-
 
 class SummaryGenerator:
     def __init__(
         self,
         llm_client: LLMClient,
-        max_chars_total: int = DEFAULT_MAX_CHARS_TOTAL,
         content_config: ContentConfig | None = None,
     ):
         self.llm = llm_client
-        self.max_chars_total = max_chars_total
         self.content_config = content_config or ContentConfig()
-        logger.info(f"SummaryGenerator initialized (max_total={max_chars_total}, content_config={self.content_config})")
+        logger.info(f"SummaryGenerator initialized (content_config={self.content_config})")
 
     def generate(self, messages: list[Message], previous_context: str = "", custom_template: str = "", interactions: list[Interaction] | None = None) -> str:
         if not messages:
             logger.debug("No messages to summarize")
             return ""
         logger.info(f"Generating summary for {len(messages)} messages (with context: {len(previous_context)} chars, interactions: {len(interactions) if interactions else 0})")
-        conversation = self._format_conversation(messages, self.max_chars_total, interactions)
+        conversation = self._format_conversation(messages, interactions)
         logger.debug(f"Formatted conversation length: {len(conversation)} chars")
 
         if custom_template and custom_template.strip():
@@ -60,19 +55,16 @@ class SummaryGenerator:
     def _format_conversation(
         self,
         messages: list[Message],
-        max_chars_total: int = DEFAULT_MAX_CHARS_TOTAL,
         interactions: list[Interaction] | None = None,
     ) -> str:
-        """格式化对话内容，使用 content_processor 解析和截断"""
-        logger.debug(f"Formatting {len(messages)} messages for summary (max_total={max_chars_total})")
+        """格式化对话内容，使用 content_processor 处理每条消息"""
+        logger.debug(f"Formatting {len(messages)} messages for summary")
         lines = []
-        total_chars = 0
 
         # 建立消息时间戳索引，用于关联 interactions
         msg_timestamps = [(msg.timestamp, msg) for msg in messages]
 
-        # 优先保留最近的消息
-        for i, msg in enumerate(reversed(messages)):
+        for i, msg in enumerate(messages):
             role_label = ROLE_LABELS.get(msg.role, msg.role)
             # 使用 content_processor 处理内容
             content = process_content(msg.content, self.content_config)
@@ -83,7 +75,7 @@ class SummaryGenerator:
             interaction_text = ""
             if interactions and msg.role == "assistant":
                 # 找到在当前消息时间戳之前、上一条消息之后的 interactions
-                prev_timestamp = msg_timestamps[len(messages) - i - 2][0] if i < len(messages) - 1 else None
+                prev_timestamp = msg_timestamps[i - 1][0] if i > 0 else None
                 related = self._get_interactions_for_message(interactions, msg.timestamp, prev_timestamp)
                 if related:
                     int_lines = []
@@ -93,11 +85,9 @@ class SummaryGenerator:
                     interaction_text = "\n" + "\n".join(int_lines)
 
             line = f"{role_label}: {content}{interaction_text}"
-            if total_chars + len(line) > max_chars_total:
-                break
-            lines.insert(0, line)
-            total_chars += len(line)
-        logger.debug(f"Formatted {len(lines)} messages, total {total_chars} chars")
+            lines.append(line)
+
+        logger.debug(f"Formatted {len(lines)} messages")
         return "\n".join(lines)
 
     def _get_interactions_for_message(self, interactions: list[Interaction], msg_timestamp, prev_timestamp) -> list[Interaction]:
