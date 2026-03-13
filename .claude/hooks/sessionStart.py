@@ -125,6 +125,16 @@ def main():
         config_kwargs = config_mgr.get_memory_manager_kwargs()
         logger.info(f"Loaded config: window={config_kwargs['short_term_window_size']}, threshold={config_kwargs['summary_trigger_threshold']}, llm={config_kwargs['llm_provider']}")
 
+        # 检查是否启用 context 注入
+        inject_context_enabled_str = config_mgr.get("inject_context_enabled")
+        inject_context_enabled = inject_context_enabled_str.lower() == "true"
+        logger.info(f"inject_context_enabled config value: '{inject_context_enabled_str}' -> {inject_context_enabled}")
+        if not inject_context_enabled:
+            logger.info("Context injection is DISABLED - starting fresh session")
+            result = {}
+            print(json.dumps(result, ensure_ascii=False))
+            return
+
         inject_summary_count = config_mgr.get_int("inject_summary_count")
         inject_recent_count = config_mgr.get_int("inject_recent_count")
         inject_knowledge_count = config_mgr.get_int("inject_knowledge_count")

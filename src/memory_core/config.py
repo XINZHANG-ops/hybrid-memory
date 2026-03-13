@@ -23,6 +23,7 @@ DEFAULT_CONFIG = {
     "input_token_price": "0.003",
     "output_token_price": "0.015",
     # 注入相关配置
+    "inject_context_enabled": "true",
     "inject_summary_count": "5",
     "inject_recent_count": "5",
     "inject_knowledge_count": "5",
@@ -177,6 +178,14 @@ CONFIG_META = {
         "group": "Stats",
     },
     # 注入相关配置
+    "inject_context_enabled": {
+        "label": "启用 Context 注入",
+        "description": "是否在会话启动时注入历史context",
+        "tooltip": "启用后，会话启动时会注入历史摘要、近期对话、知识和决策。禁用后，Claude Code将以全新状态启动，无任何历史记忆。适用于不想被历史影响的场景。影响模块：sessionStart hook",
+        "type": "select",
+        "options": ["true", "false"],
+        "group": "Inject",
+    },
     "inject_summary_count": {
         "label": "注入摘要数量",
         "description": "启动时自动注入的历史摘要数量",

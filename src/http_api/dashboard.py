@@ -131,6 +131,25 @@ def list_projects():
     })
 
 
+@app.route("/api/projects/<project_name>", methods=["DELETE"])
+def delete_project(project_name):
+    """删除项目及其数据库文件"""
+    db_path = PROJECTS_DIR / f"{project_name}.db"
+    if not db_path.exists():
+        return json_response({"error": "Project not found"}), 404
+
+    try:
+        # 删除数据库文件
+        db_path.unlink()
+        logger.info(f"Deleted project: {project_name}")
+        from src.memory_core import publish_event
+        publish_event("project", f"Project deleted: {project_name}", project_name)
+        return json_response({"status": "ok", "message": f"Project '{project_name}' deleted"})
+    except Exception as e:
+        logger.error(f"Failed to delete project {project_name}: {e}")
+        return json_response({"error": str(e)}), 500
+
+
 @app.route("/api/projects/<project_name>/sessions")
 def get_sessions(project_name):
     db_path = PROJECTS_DIR / f"{project_name}.db"
@@ -2731,13 +2750,16 @@ def index():
 
             // Project list
             document.getElementById('project-list').innerHTML = projects.map(p => `
-                <div class="card" style="cursor: pointer;" onclick="selectProject('${p.name}')">
-                    <div class="card-header"><strong>${p.name}</strong><span class="badge">${p.messages || 0} msgs</span></div>
-                    <div>Sessions: ${p.sessions || 0} | Summaries: ${p.summaries || 0}</div>
-                    <div style="margin-top: 6px; font-size: 12px; color: #aaa;">
-                        <span title="Input tokens">📥 ${formatTokens(p.input_tokens || 0)}</span>
-                        <span style="margin-left: 8px;" title="Output tokens">📤 ${formatTokens(p.output_tokens || 0)}</span>
-                        <span style="margin-left: 8px; color: #f39c12;" title="Cost">💰 $${(p.cost || 0).toFixed(4)}</span>
+                <div class="card" style="position: relative;">
+                    <button onclick="deleteProject('${p.name}', event)" style="position: absolute; top: 8px; right: 8px; width: 24px; height: 24px; padding: 0; background: rgba(233, 69, 96, 0.8); font-size: 0.75em; border-radius: 4px; z-index: 10; display: flex; align-items: center; justify-content: center;" title="Delete project">🗑️</button>
+                    <div style="cursor: pointer; padding-right: 30px;" onclick="selectProject('${p.name}')">
+                        <div class="card-header"><strong>${p.name}</strong><span class="badge">${p.messages || 0} msgs</span></div>
+                        <div>Sessions: ${p.sessions || 0} | Summaries: ${p.summaries || 0}</div>
+                        <div style="margin-top: 6px; font-size: 12px; color: #aaa;">
+                            <span title="Input tokens">📥 ${formatTokens(p.input_tokens || 0)}</span>
+                            <span style="margin-left: 8px;" title="Output tokens">📤 ${formatTokens(p.output_tokens || 0)}</span>
+                            <span style="margin-left: 8px; color: #f39c12;" title="Cost">💰 $${(p.cost || 0).toFixed(4)}</span>
+                        </div>
                     </div>
                 </div>
             `).join('');
@@ -2764,6 +2786,31 @@ def index():
             document.getElementById('global-project').value = name;
             localStorage.setItem('currentProject', name);
             loadProjectData();
+        }
+
+        async function deleteProject(name, event) {
+            event.stopPropagation();  // 阻止触发 selectProject
+            if (!confirm(`确定要删除项目 "${name}" 吗？\n\n这将永久删除项目数据库文件，包括所有消息、摘要、知识和决策。此操作无法撤销！`)) {
+                return;
+            }
+            try {
+                const res = await fetch(`/api/projects/${name}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (res.ok) {
+                    // 如果删除的是当前项目，清空选择
+                    if (currentProject === name) {
+                        currentProject = '';
+                        localStorage.removeItem('currentProject');
+                    }
+                    // 重新加载项目列表
+                    await loadProjects();
+                    showPanel('overview');
+                } else {
+                    alert('删除失败: ' + (data.error || '未知错误'));
+                }
+            } catch (error) {
+                alert('删除失败: ' + error.message);
+            }
         }
 
         async function loadSessions() {
@@ -3877,7 +3924,7 @@ def index():
                 },
                 'Inject': {
                     icon: '💉',
-                    keys: ['inject_summary_count', 'inject_recent_count', 'inject_knowledge_count', 'inject_decision_count']
+                    keys: ['inject_context_enabled', 'inject_summary_count', 'inject_recent_count', 'inject_knowledge_count', 'inject_decision_count']
                 },
                 'Stats': {
                     icon: '📊',
@@ -3953,7 +4000,7 @@ def index():
                 'llm_provider', 'ollama_model', 'ollama_base_url', 'ollama_timeout', 'ollama_keep_alive',
                 'anthropic_model', 'embedding_model', 'embedding_base_url', 'enable_vector_search', 'enable_knowledge_extraction',
                 'input_token_price', 'output_token_price',
-                'inject_summary_count', 'inject_recent_count', 'inject_knowledge_count', 'inject_decision_count',
+                'inject_context_enabled', 'inject_summary_count', 'inject_recent_count', 'inject_knowledge_count', 'inject_decision_count',
                 'content_include_thinking', 'content_include_tool', 'content_include_text',
                 'content_max_chars_thinking', 'content_max_chars_tool', 'content_max_chars_text',
                 'knowledge_max_items_per_category',
