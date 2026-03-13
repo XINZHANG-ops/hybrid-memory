@@ -2751,7 +2751,7 @@ def index():
             // Project list
             document.getElementById('project-list').innerHTML = projects.map(p => `
                 <div class="card" style="position: relative;">
-                    <button onclick="deleteProject('${p.name}', event)" style="position: absolute; top: 8px; right: 8px; width: 24px; height: 24px; padding: 0; background: rgba(233, 69, 96, 0.8); font-size: 0.75em; border-radius: 4px; z-index: 10; display: flex; align-items: center; justify-content: center;" title="Delete project">🗑️</button>
+                    <button onclick="event.stopPropagation(); deleteProject('${p.name}')" style="position: absolute; top: 8px; right: 8px; width: 24px; height: 24px; padding: 0; background: rgba(233, 69, 96, 0.8); font-size: 0.75em; border-radius: 4px; z-index: 10; display: flex; align-items: center; justify-content: center;" title="Delete project">🗑️</button>
                     <div style="cursor: pointer; padding-right: 30px;" onclick="selectProject('${p.name}')">
                         <div class="card-header"><strong>${p.name}</strong><span class="badge">${p.messages || 0} msgs</span></div>
                         <div>Sessions: ${p.sessions || 0} | Summaries: ${p.summaries || 0}</div>
@@ -2788,8 +2788,7 @@ def index():
             loadProjectData();
         }
 
-        async function deleteProject(name, event) {
-            event.stopPropagation();  // 阻止触发 selectProject
+        async function deleteProject(name) {
             if (!confirm(`确定要删除项目 "${name}" 吗？\n\n这将永久删除项目数据库文件，包括所有消息、摘要、知识和决策。此操作无法撤销！`)) {
                 return;
             }
@@ -2805,11 +2804,12 @@ def index():
                     // 重新加载项目列表
                     await loadProjects();
                     showPanel('overview');
+                    showStatus(`项目 "${name}" 已删除`, 'success');
                 } else {
-                    alert('删除失败: ' + (data.error || '未知错误'));
+                    showStatus('删除失败: ' + (data.error || '未知错误'), 'error');
                 }
             } catch (error) {
-                alert('删除失败: ' + error.message);
+                showStatus('删除失败: ' + error.message, 'error');
             }
         }
 
